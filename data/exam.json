@@ -1,0 +1,162 @@
+[
+ {
+  "id": 0,
+  "level": "medium",
+  "db_id": "wta_1",
+  "question": "What are the first names of all players, and their total ranking points?",
+  "gold_sql": "SELECT sum(ranking_points) ,  T1.first_name FROM players AS T1 JOIN rankings AS T2 ON T1.player_id  =  T2.player_id GROUP BY T1.first_name",
+  "bench": "spider"
+ },
+ {
+  "id": 1,
+  "level": "easy",
+  "db_id": "student_transcripts_tracking",
+  "question": "How many courses in total are listed?",
+  "gold_sql": "SELECT count(*) FROM Courses",
+  "bench": "spider"
+ },
+ {
+  "id": 2,
+  "level": "medium",
+  "db_id": "concert_singer",
+  "question": "What are the names of the singers who performed in a concert in 2014?",
+  "gold_sql": "SELECT T2.name FROM singer_in_concert AS T1 JOIN singer AS T2 ON T1.singer_id  =  T2.singer_id JOIN concert AS T3 ON T1.concert_id  =  T3.concert_id WHERE T3.year  =  2014",
+  "bench": "spider"
+ },
+ {
+  "id": 3,
+  "level": "medium",
+  "db_id": "tvshow",
+  "question": "What is the TV Channel that shows the cartoon \"The Rise of the Blue Beetle!\"? List the TV Channel's series name.",
+  "gold_sql": "SELECT T1.series_name FROM TV_Channel AS T1 JOIN Cartoon AS T2 ON T1.id = T2.Channel WHERE T2.Title = \"The Rise of the Blue Beetle!\";",
+  "bench": "spider"
+ },
+ {
+  "id": 4,
+  "level": "hard",
+  "db_id": "tvshow",
+  "question": "What is the series name and country of all TV channels that are playing cartoons directed by Ben Jones and cartoons directed by Michael Chang?",
+  "gold_sql": "SELECT T1.series_name ,  T1.country FROM TV_Channel AS T1 JOIN cartoon AS T2 ON T1.id = T2.Channel WHERE T2.directed_by  =  'Michael Chang' INTERSECT SELECT T1.series_name ,  T1.country FROM TV_Channel AS T1 JOIN cartoon AS T2 ON T1.id = T2.Channel WHERE T2.directed_by  =  'Ben Jones'",
+  "bench": "spider"
+ },
+ {
+  "id": 5,
+  "level": "hard",
+  "db_id": "car_1",
+  "question": "How many car makers are there in each continents? List the continent name and the count.",
+  "gold_sql": "SELECT T1.Continent ,  count(*) FROM CONTINENTS AS T1 JOIN COUNTRIES AS T2 ON T1.ContId  =  T2.continent JOIN car_makers AS T3 ON T2.CountryId  =  T3.Country GROUP BY T1.Continent;",
+  "bench": "spider"
+ },
+ {
+  "id": 6,
+  "level": "easy",
+  "db_id": "pets_1",
+  "question": "How many pets have a greater weight than 10?",
+  "gold_sql": "SELECT count(*) FROM pets WHERE weight  >  10",
+  "bench": "spider"
+ },
+ {
+  "id": 7,
+  "level": "medium",
+  "db_id": "concert_singer",
+  "question": "List all singer names in concerts in year 2014.",
+  "gold_sql": "SELECT T2.name FROM singer_in_concert AS T1 JOIN singer AS T2 ON T1.singer_id  =  T2.singer_id JOIN concert AS T3 ON T1.concert_id  =  T3.concert_id WHERE T3.year  =  2014",
+  "bench": "spider"
+ },
+ {
+  "id": 8,
+  "level": "easy",
+  "db_id": "wta_1",
+  "question": "What is the code of the country with the most players?",
+  "gold_sql": "SELECT country_code FROM players GROUP BY country_code ORDER BY count(*) DESC LIMIT 1",
+  "bench": "spider"
+ },
+ {
+  "id": 9,
+  "level": "easy",
+  "db_id": "cre_Doc_Template_Mgt",
+  "question": "What are the ids of templates with template type code PP or PPT?",
+  "gold_sql": "SELECT template_id FROM Templates WHERE template_type_code  =  \"PP\" OR template_type_code  =  \"PPT\"",
+  "bench": "spider"
+ },
+ {
+  "id": 10,
+  "level": "easy",
+  "db_id": "employee_hire_evaluation",
+  "question": "How many employees are there?",
+  "gold_sql": "SELECT count(*) FROM employee",
+  "bench": "spider"
+ },
+ {
+  "id": 11,
+  "level": "easy",
+  "db_id": "student_transcripts_tracking",
+  "question": "When was the last transcript released?",
+  "gold_sql": "SELECT transcript_date FROM Transcripts ORDER BY transcript_date DESC LIMIT 1",
+  "bench": "spider"
+ },
+ {
+  "id": 12,
+  "level": "easy",
+  "db_id": "employee_hire_evaluation",
+  "question": "find the minimum and maximum number of products of all stores.",
+  "gold_sql": "SELECT min(Number_products) ,  max(Number_products) FROM shop",
+  "bench": "spider"
+ },
+ {
+  "id": 13,
+  "level": "hard",
+  "db_id": "student_transcripts_tracking",
+  "question": "Find the semester when both Master students and Bachelor students got enrolled in.",
+  "gold_sql": "SELECT DISTINCT T2.semester_id FROM Degree_Programs AS T1 JOIN Student_Enrolment AS T2 ON T1.degree_program_id  =  T2.degree_program_id WHERE degree_summary_name  =  'Master' INTERSECT SELECT DISTINCT T2.semester_id FROM Degree_Programs AS T1 JOIN Student_Enrolment AS T2 ON T1.degree_program_id  =  T2.degree_program_id WHERE degree_summary_name  =  'Bachelor'",
+  "bench": "spider"
+ },
+ {
+  "id": 14,
+  "level": "medium",
+  "db_id": "car_1",
+  "question": "Which distinct car models are the produced after 1980?",
+  "gold_sql": "SELECT DISTINCT T1.model FROM MODEL_LIST AS T1 JOIN CAR_NAMES AS T2 ON T1.model  =  T2.model JOIN CARS_DATA AS T3 ON T2.MakeId  =  T3.id WHERE T3.year  >  1980;",
+  "bench": "spider"
+ },
+ {
+  "id": 15,
+  "level": "medium",
+  "db_id": "world_1",
+  "question": "What language is predominantly spoken in Aruba?",
+  "gold_sql": "SELECT T2.Language FROM country AS T1 JOIN countrylanguage AS T2 ON T1.Code  =  T2.CountryCode WHERE T1.Name  =  \"Aruba\" ORDER BY Percentage DESC LIMIT 1",
+  "bench": "spider"
+ },
+ {
+  "id": 16,
+  "level": "medium",
+  "db_id": "flight_2",
+  "question": "What are flight numbers of flights departing from City \"Aberdeen \"?",
+  "gold_sql": "SELECT T1.FlightNo FROM FLIGHTS AS T1 JOIN AIRPORTS AS T2 ON T1.SourceAirport   =  T2.AirportCode WHERE T2.City  =  \"Aberdeen\"",
+  "bench": "spider"
+ },
+ {
+  "id": 17,
+  "level": "easy",
+  "db_id": "flight_2",
+  "question": "Return the number of airlines in the USA.",
+  "gold_sql": "SELECT count(*) FROM AIRLINES WHERE Country  =  \"USA\"",
+  "bench": "spider"
+ },
+ {
+  "id": 18,
+  "level": "medium",
+  "db_id": "flight_2",
+  "question": "What are airlines that have flights arriving at airport 'AHD'?",
+  "gold_sql": "SELECT T1.Airline FROM AIRLINES AS T1 JOIN FLIGHTS AS T2 ON T1.uid  =  T2.Airline WHERE T2.DestAirport  =  \"AHD\"",
+  "bench": "spider"
+ },
+ {
+  "id": 19,
+  "level": "hard",
+  "db_id": "concert_singer",
+  "question": "What are the names and locations of the stadiums that had concerts that occurred in both 2014 and 2015?",
+  "gold_sql": "SELECT T2.name ,  T2.location FROM concert AS T1 JOIN stadium AS T2 ON T1.stadium_id  =  T2.stadium_id WHERE T1.Year  =  2014 INTERSECT SELECT T2.name ,  T2.location FROM concert AS T1 JOIN stadium AS T2 ON T1.stadium_id  =  T2.stadium_id WHERE T1.Year  =  2015",
+  "bench": "spider"
+ }
+]

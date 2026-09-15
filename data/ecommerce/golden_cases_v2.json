@@ -1,0 +1,138 @@
+{
+ "note": "归因场景 Golden Cases v2。每 case: 用户完整请求 + 机械可查期望 + 人工判定列。跑法: 逐题, 追问题用同会话。",
+ "cases": [
+  {
+   "id": "G1-查数回归",
+   "question": "近7天商品支付金额是多少？",
+   "session": "new",
+   "expect": {
+    "numbers": [
+     800000
+    ],
+    "conclusion_must_contain": [
+     "商品支付金额"
+    ],
+    "must_call_tools": [],
+    "must_say": []
+   }
+  },
+  {
+   "id": "G2-对比",
+   "question": "近7天比前7天变化多少？",
+   "session": "continue",
+   "expect": {
+    "numbers": [
+     800000,
+     1000000,
+     200000
+    ],
+    "conclusion_must_contain": [
+     "20",
+     "减少"
+    ],
+    "must_call_tools": [],
+    "must_say": []
+   }
+  },
+  {
+   "id": "G3-复合归因",
+   "question": "查一下最近的GMV，然后分析一下为什么下降",
+   "session": "new",
+   "expect": {
+    "numbers": [
+     800000,
+     1000000,
+     -200000
+    ],
+    "conclusion_must_contain": [
+     "家电",
+     "直通车",
+     "待验证"
+    ],
+    "must_call_tools": [
+     "get_shop_traffic",
+     "get_market_overview",
+     "get_funnel"
+    ],
+    "must_say": []
+   }
+  },
+  {
+   "id": "G4-净贡献125",
+   "question": "家电下降占总下降的比例是多少？",
+   "session": "continue",
+   "expect": {
+    "numbers": [
+     250000,
+     125
+    ],
+    "conclusion_must_contain": [
+     [
+      "抵消",
+      "对冲"
+     ],
+     "其他"
+    ],
+    "must_call_tools": [],
+    "must_say": [
+     [
+      "其他行业在增长",
+      "逆势增长",
+      "逆势"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "G5-泛化-流量结构",
+   "question": "我们店流量结构最近有什么变化？",
+   "session": "new",
+   "expect": {
+    "numbers": [],
+    "conclusion_must_contain": [
+     "直通车",
+     "搜索",
+     "占比"
+    ],
+    "must_call_tools": [
+     "get_shop_traffic"
+    ],
+    "must_say": []
+   }
+  },
+  {
+   "id": "G6-缺数-漏斗可答",
+   "question": "转化率下滑的原因是什么？",
+   "session": "new",
+   "expect": {
+    "numbers": [],
+    "conclusion_must_contain": [
+     "加购"
+    ],
+    "must_call_tools": [
+     "get_funnel"
+    ],
+    "must_say": [
+     "未接入"
+    ]
+   }
+  },
+  {
+   "id": "G7-未开放指标",
+   "question": "退款率最近怎么样？",
+   "session": "new",
+   "expect": {
+    "numbers": [],
+    "conclusion_must_contain": [
+     "缺失"
+    ],
+    "must_call_tools": [],
+    "must_say": [],
+    "must_not_contain": [
+     "%",
+     "元"
+    ]
+   }
+  }
+ ]
+}

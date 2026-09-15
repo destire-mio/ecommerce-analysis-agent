@@ -1,0 +1,37 @@
+# 指标注册表（按 PRD 08.3 格式，批准口径）
+
+metrics:
+  - metric_id: paid_gmv_item          # 商品支付金额
+    version: 1
+    name: 商品支付金额
+    unit: CNY
+    time_basis: pay_time              # 订单支付时间
+    timezone: Asia/Shanghai
+    day_boundary: "半开区间 [start, end)，end=次日 00:00 —— 防 BETWEEN 字符串边界坑"
+    source_model: order_items
+    total_expression: SUM(amount)
+    required_scope:
+      shop_id: 1
+      order_status: paid              # 未支付订单不入口径
+    refund_policy: 支付发生额，不抵减后续退款（退款数据首期缺失，单列不混用）
+    grain: order_id + category       # 一行=一笔订单中的一个商品行；跨品类订单在两个品类各计一次
+    zero_policy: 基期为 0 时展示差额，环比显示"不适用"，禁止输出无穷大
+    owner: 业务负责人（演示版本）
+    status: approved
+
+  - metric_id: paid_orders            # 支付订单数（去重）
+    version: 1
+    name: 支付订单数
+    unit: 单
+    time_basis: pay_time
+    timezone: Asia/Shanghai
+    source_model: orders
+    total_expression: COUNT(DISTINCT order_id)
+    required_scope:
+      shop_id: 1
+      order_status: paid
+    dedup_rule: 店铺口径必须按 order_id 去重；品类口径按品类行计数（跨品类订单在两个品类各计一次，
+                因此品类订单数之和 > 店铺去重订单数，这是正确行为不是 bug）
+    zero_policy: 同上
+    owner: 业务负责人（演示版本）
+    status: approved

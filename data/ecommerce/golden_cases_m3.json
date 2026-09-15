@@ -1,0 +1,53 @@
+{
+ "note": "M3 语义层跨源 Golden Cases。验证: 平台指标(MCP)以 provider 进语义层后, agent 用 query_metrics 点菜查访客数/转化率; 跨源比率按公共维度 date 对齐; 访客按品类拆被规划器拦截。判分同现有: 数字+语义词+trace 工具核查。",
+ "cases": [
+  {
+   "id": "M3-1-访客总量",
+   "question": "我们店近7天访客数是多少？",
+   "session": "new",
+   "expect": {
+    "numbers": [110596],
+    "conclusion_must_contain": ["访客"],
+    "must_call_tools": ["query_metrics"],
+    "must_say": []
+   }
+  },
+  {
+   "id": "M3-2-渠道拆解",
+   "question": "近7天各渠道的访客数分别是多少？",
+   "session": "new",
+   "expect": {
+    "numbers": [56057, 27212],
+    "conclusion_must_contain": ["直通车", "搜索"],
+    "must_call_tools": ["query_metrics"],
+    "must_say": []
+   }
+  },
+  {
+   "id": "M3-3-跨源转化率",
+   "question": "近7天每天的转化率是多少？",
+   "session": "new",
+   "expect": {
+    "numbers": [],
+    "conclusion_must_contain": [["转化率"], ["天"]],
+    "must_call_tools": ["query_metrics"],
+    "must_say": [["订单", "支付"]]
+   }
+  },
+  {
+   "id": "M3-4-访客按品类被拦",
+   "question": "近7天各品类的访客数是多少？",
+   "session": "new",
+   "expect": {
+    "numbers": [],
+    "conclusion_must_contain": [["无法", "不能", "不支持", "缺失"]],
+    "must_call_tools": ["query_metrics"],
+    "must_say": [
+     "访客",
+     ["品类", "渠道", "维度", "数据"]
+    ],
+    "must_not_contain": []
+   }
+  }
+ ]
+}

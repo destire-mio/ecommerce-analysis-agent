@@ -1,0 +1,55 @@
+{
+ "note": "口径解释场景 Golden Cases（S3）。验证现有设计覆盖口径解释——防'说法幻觉'：陈述必须与批准口径/实际计算一致。判分全语义特征组，不绑字面。",
+ "cases": [
+  {
+   "id": "S3-1-基线查数",
+   "question": "近7天商品支付金额是多少？",
+   "session": "new",
+   "expect": {
+    "numbers": [800000],
+    "conclusion_must_contain": ["商品支付金额"],
+    "must_call_tools": [],
+    "must_say": []
+   }
+  },
+  {
+   "id": "S3-2-追问-退款边界",
+   "question": "这个数含不含退款？",
+   "session": "continue",
+   "expect": {
+    "numbers": [],
+    "conclusion_must_contain": [["不抵减", "不扣减", "不从中扣减", "不含退款", "退款前"]],
+    "must_not_contain": ["已扣除退款", "扣除了退款", "已扣减退款", "已减去退款"],
+    "must_call_tools": [],
+    "must_say": []
+   }
+  },
+  {
+   "id": "S3-3-直问-口径",
+   "question": "商品支付金额是什么口径？",
+   "session": "new",
+   "expect": {
+    "numbers": [],
+    "conclusion_must_contain": [
+     ["SUM", "求和", "加总", "相加"],
+     ["order_items", "订单明细", "商品行", "fct_sales_line"],
+     ["paid", "已支付", "已付款"],
+     ["pay_time", "支付时间"]
+    ],
+    "must_call_tools": ["read_skill"],
+    "must_say": [["不抵减", "不含退款", "不扣减", "退款未接入"]]
+   }
+  },
+  {
+   "id": "S3-4-直问-表来源",
+   "question": "商品支付金额来自哪张表？",
+   "session": "new",
+   "expect": {
+    "numbers": [],
+    "conclusion_must_contain": [["order_items", "订单明细"]],
+    "must_call_tools": [],
+    "must_say": []
+   }
+  }
+ ]
+}

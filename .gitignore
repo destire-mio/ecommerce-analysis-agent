@@ -1,0 +1,21 @@
+# Local Python environment and caches
+.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Runtime-generated traces, sessions, reports, and evaluation output
+runs/
+sessions/
+reports/
+results/
+
+# Large benchmark/data distributions not required by the ecommerce agent
+benchmarks/commerce_e2e/artifacts/
+data/minidev/
+data/spider_data/
+data/profiles/
+data/*.zip
+
+# OS/editor files
+.DS_Store

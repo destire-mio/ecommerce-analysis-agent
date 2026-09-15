@@ -1,0 +1,41 @@
+{
+ "note": "M4 LMDI 归因 Golden Cases。重点验证乘法归因必须走 calculate(lmdi)、贡献闭合、单均不变如实报0，以及单因素为0时返回不适用和残差。需余额后运行。",
+ "cases": [
+  {
+   "id": "M4-1-LMDI归因",
+   "question": "近7天相比前7天 GMV 下降主要是什么因素造成的？",
+   "session": "new",
+   "expect": {
+    "numbers": [99502.43, -299502.43],
+    "conclusion_must_contain": [["访客数", "访客"], "转化率", ["贡献", "因素"]],
+    "must_call_tools": ["calculate"],
+    "must_say": [],
+    "must_not_contain": []
+   }
+  },
+  {
+   "id": "M4-2-客单价无影响",
+   "question": "客单价对这次 GMV 下降有影响吗？",
+   "session": "new",
+   "expect": {
+    "numbers": [0.0],
+    "conclusion_must_contain": [["客单价", "单均金额"], ["没有", "0"]],
+    "must_call_tools": ["calculate"],
+    "must_say": [],
+    "must_not_contain": []
+   }
+  },
+  {
+   "id": "M4-3-零因素残差",
+   "question": "如果上周没有转化（0%）、这周有了，能做 LMDI 分解吗？",
+   "session": "new",
+   "expect": {
+    "numbers": [],
+    "conclusion_must_contain": [["不适用", "无法"], "残差"],
+    "must_call_tools": ["calculate"],
+    "must_say": [["0因素", "零因素", "基期为0", "转化率"]],
+    "must_not_contain": []
+   }
+  }
+ ]
+}

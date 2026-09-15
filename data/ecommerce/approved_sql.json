@@ -1,0 +1,42 @@
+{
+  "note": "每道 Golden Case 的批准 SQL。执行环境: SQLite, 表已从 CSV 导入。日期口径: [start, end) 半开区间。",
+  "period": {
+    "curr_start": "2026-09-06", "curr_end_excl": "2026-09-13",
+    "prev_start": "2026-08-30", "prev_end_excl": "2026-09-06"
+  },
+  "cases": [
+    {"id": 1, "metric": "paid_gmv_item",
+     "sql": "SELECT SUM(i.amount) FROM order_items i JOIN orders o USING(order_id) WHERE o.shop_id=1 AND o.status='paid' AND o.pay_time >= '2026-09-06' AND o.pay_time < '2026-09-13'",
+     "expect": 800000},
+    {"id": 2, "metric": "paid_gmv_item 对比",
+     "sql_two_phase": true,
+     "sql_curr": "同 id:1",
+     "sql_prev": "SELECT SUM(i.amount) FROM order_items i JOIN orders o ON o.order_id=i.order_id WHERE o.shop_id=1 AND o.status='paid' AND o.pay_time >= '2026-08-30' AND o.pay_time < '2026-09-06'",
+     "expect_curr": 800000, "expect_prev": 1000000, "expect_delta": -200000, "expect_pct": -20.0},
+    {"id": 3, "metric": "品类拆解",
+     "sql": "SELECT i.category, SUM(i.amount) AS amt, SUM(i.amount) - CASE i.category WHEN '服饰' THEN 600000 WHEN '家居' THEN 400000 END AS delta FROM order_items i JOIN orders o ON o.order_id=i.order_id WHERE o.shop_id=1 AND o.status='paid' AND o.pay_time >= '2026-09-06' AND o.pay_time < '2026-09-13' GROUP BY i.category",
+     "expect": {"服饰": -250000, "家居": 50000, "最大降幅品类": "服饰"}},
+    {"id": 4, "metric": "paid_orders",
+     "sql": "SELECT SUM(CASE WHEN o.pay_time >= '2026-09-06' AND o.pay_time < '2026-09-13' THEN 1 ELSE 0 END) AS curr, SUM(CASE WHEN o.pay_time >= '2026-08-30' AND o.pay_time < '2026-09-06' THEN 1 ELSE 0 END) AS prev FROM orders o WHERE o.shop_id=1 AND o.status='paid'",
+     "expect": {"curr": 4000, "prev": 5000, "delta": -1000}},
+    {"id": 5, "metric": "单均金额",
+     "sql": "SELECT CAST(SUM(CASE WHEN o.pay_time >= '2026-09-06' AND o.pay_time < '2026-09-13' THEN i.amount END) AS REAL) / (SELECT COUNT(*) FROM orders o WHERE o.shop_id=1 AND o.status='paid' AND o.pay_time >= '2026-09-06' AND o.pay_time < '2026-09-13') FROM order_items i JOIN orders o ON o.order_id=i.order_id WHERE o.shop_id=1 AND o.status='paid' AND o.pay_time >= '2026-09-06' AND o.pay_time < '2026-09-13'",
+     "expect": 200.0},
+    {"id": 6, "metric": "paid_gmv_item 品类过滤",
+     "sql": "SELECT SUM(i.amount) FROM order_items i JOIN orders o ON o.order_id=i.order_id WHERE o.shop_id=1 AND o.status='paid' AND o.pay_time >= '2026-09-06' AND o.pay_time < '2026-09-13' AND i.category='服饰'",
+     "expect": 350000},
+    {"id": 7, "metric": "品类 Top 商品",
+     "sql": "SELECT i.product_id, SUM(i.amount) AS amt FROM order_items i JOIN orders o ON o.order_id=i.order_id WHERE o.shop_id=1 AND o.status='paid' AND o.pay_time >= '2026-09-06' AND o.pay_time < '2026-09-13' AND i.category='服饰' GROUP BY i.product_id ORDER BY amt DESC LIMIT 1",
+     "expect_product": "P0016", "expect_amount": 1541},
+    {"id": 8, "metric": "missing_data",
+     "sql": null,
+     "expect": {"answer_type": "missing_data", "must_say": "访问数据缺失"}},
+    {"id": 9, "metric": "trap: 品类订单数 vs 店铺去重",
+     "sql_rows": "SELECT COUNT(*) FROM order_items i JOIN orders o ON o.order_id=i.order_id WHERE o.shop_id=1 AND o.status='paid' AND o.pay_time >= '2026-09-06' AND o.pay_time < '2026-09-13'",
+     "sql_dedup": "SELECT COUNT(DISTINCT order_id) FROM orders WHERE shop_id=1 AND status='paid' AND pay_time >= '2026-09-06' AND pay_time < '2026-09-13'",
+     "expect": {"not_equal": true}},
+    {"id": 10, "metric": "trap: 重复导入",
+     "note": "导入 duplicate_orders.csv 后按 order_id 去重, id:1 的 SQL 结果必须仍为 800000",
+     "expect": 800000}
+  ]
+}

@@ -1,0 +1,182 @@
+[
+ {
+  "id": 0,
+  "level": "challenging",
+  "db_id": "codebase_community",
+  "question": "Based on posts posted by Community, calculate the percentage of posts that use the R language.",
+  "evidence": "DIVIDE(COUNT(PostId WHERE TagName = 'r')), (COUNT(PostId WHERE DisplayName = 'Community')) as percentage; R language refers to tagname = 'r'",
+  "gold_sql": "SELECT CAST(SUM(IIF(T3.TagName = 'r', 1, 0)) AS REAL) * 100 / COUNT(T1.Id) FROM users AS T1 INNER JOIN postHistory AS T2 ON T1.Id = T2.UserId INNER JOIN tags AS T3 ON T3.ExcerptPostId = T2.PostId WHERE T1.DisplayName = 'Community'",
+  "bench": "bird"
+ },
+ {
+  "id": 1,
+  "level": "moderate",
+  "db_id": "student_club",
+  "question": "Which student has been entrusted to manage the budget for the Yearly Kickoff?",
+  "evidence": "name of students means the full name; full name refers to first_name, last_name;'Yearly Kickoff' is an event name;",
+  "gold_sql": "SELECT T4.first_name, T4.last_name FROM event AS T1 INNER JOIN budget AS T2 ON T1.event_id = T2.link_to_event INNER JOIN expense AS T3 ON T2.budget_id = T3.link_to_budget INNER JOIN member AS T4 ON T3.link_to_member = T4.member_id WHERE T1.event_name = 'Yearly Kickoff'",
+  "bench": "bird"
+ },
+ {
+  "id": 2,
+  "level": "simple",
+  "db_id": "formula_1",
+  "question": "For the Bahrain Grand Prix in 2007, how many drivers not finished the game?",
+  "evidence": "Bahrain Grand Prix refers to races.name = 'Bahrain Grand Prix'; drivers who finished the race refers to time is not empty (i.e. time IS NOT NULL);",
+  "gold_sql": "SELECT COUNT(T3.driverId) FROM races AS T1 INNER JOIN results AS T2 ON T2.raceId = T1.raceId INNER JOIN drivers AS T3 ON T3.driverId = T2.driverId WHERE T1.year = 2007 AND T1.name = 'Bahrain Grand Prix' AND T2.time IS NULL",
+  "bench": "bird"
+ },
+ {
+  "id": 3,
+  "level": "moderate",
+  "db_id": "debit_card_specializing",
+  "question": "For all the transactions happened during 8:00-9:00 in 2012/8/26, how many happened in CZE?",
+  "evidence": "Czech Republic can be represented as the Country value in the gasstations table is 'CZE'; '2012/8/26' can be represented by '2012-08-26'; during 8:00-9:00 can be represented as Time BETWEEN '08:00:00' AND '09:00:00'",
+  "gold_sql": "SELECT COUNT(T1.TransactionID) FROM transactions_1k AS T1 INNER JOIN gasstations AS T2 ON T1.GasStationID = T2.GasStationID WHERE T1.Date = '2012-08-26' AND T1.Time BETWEEN '08:00:00' AND '09:00:00' AND T2.Country = 'CZE'",
+  "bench": "bird"
+ },
+ {
+  "id": 4,
+  "level": "moderate",
+  "db_id": "formula_1",
+  "question": "On what year did the youngest driver had his first qualifying race? Also state the name, date and time of the race.",
+  "evidence": "date of birth refers to drivers.dob; The larger the birthday value, the younger the person is, and vice versa; first qualifying race refers to MIN(races.date);",
+  "gold_sql": "SELECT T3.year, T3.name, T3.date, T3.time FROM qualifying AS T1 INNER JOIN drivers AS T2 on T1.driverId = T2.driverId INNER JOIN races AS T3 on T1.raceId = T3.raceId WHERE T1.driverId = ( SELECT driverId FROM drivers ORDER BY dob DESC LIMIT 1 ) ORDER BY T3.date ASC LIMIT 1",
+  "bench": "bird"
+ },
+ {
+  "id": 5,
+  "level": "moderate",
+  "db_id": "thrombosis_prediction",
+  "question": "Among the patients who has a normal level of anti-centromere and a normal level of anti-SSB, how many of them are male?",
+  "evidence": "normal level of anti-centromere refers to CENTROMEA IN('-', '+-'); normal level of anti-SSB refers to SSB IN('-', '+-'); male refers to Sex = 'M'; Should consider DISTINCT in the final result;",
+  "gold_sql": "SELECT COUNT(DISTINCT T1.ID) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.CENTROMEA IN ('negative', '0') AND T2.SSB IN ('negative', '0') AND T1.SEX = 'M'",
+  "bench": "bird"
+ },
+ {
+  "id": 6,
+  "level": "simple",
+  "db_id": "debit_card_specializing",
+  "question": "Please list the product description of the products consumed in September, 2013.",
+  "evidence": "September 2013 refers to 201309; The first 4 strings of the Date values in the yearmonth table can represent year; The 5th and 6th string of the date can refer to month.",
+  "gold_sql": "SELECT T3.Description FROM transactions_1k AS T1 INNER JOIN yearmonth AS T2 ON T1.CustomerID = T2.CustomerID INNER JOIN products AS T3 ON T1.ProductID = T3.ProductID WHERE T2.Date = '201309'",
+  "bench": "bird"
+ },
+ {
+  "id": 7,
+  "level": "challenging",
+  "db_id": "debit_card_specializing",
+  "question": "For the customer who paid 634.8 in 2012/8/25, what was the consumption decrease rate from Year 2012 to 2013?",
+  "evidence": "'2012/8/24' can be represented by '2012-08-24'; Consumption decrease rate = (consumption_2012 - consumption_2013) / consumption_2012",
+  "gold_sql": "SELECT CAST(SUM(IIF(SUBSTRING(Date, 1, 4) = '2012', Consumption, 0)) - SUM(IIF(SUBSTRING(Date, 1, 4) = '2013', Consumption, 0)) AS FLOAT) / SUM(IIF(SUBSTRING(Date, 1, 4) = '2012', Consumption, 0)) FROM yearmonth WHERE CustomerID = ( SELECT T1.CustomerID FROM transactions_1k AS T1 INNER JOIN gasstations AS T2 ON T1.GasStationID = T2.GasStationID WHERE T1.Date = '2012-08-25' AND T1.Price  = 1513.12 )",
+  "bench": "bird"
+ },
+ {
+  "id": 8,
+  "level": "simple",
+  "db_id": "thrombosis_prediction",
+  "question": "What is the disease patient '30609' diagnosed with. List all the date of laboratory tests done for this patient.",
+  "evidence": "'30609' is the Patient ID; disease means Diagnosis",
+  "gold_sql": "SELECT T1.Diagnosis, T2.Date FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T1.ID = 30609",
+  "bench": "bird"
+ },
+ {
+  "id": 9,
+  "level": "challenging",
+  "db_id": "card_games",
+  "question": "List the names of all the cards in the set Hour of Devastation and find the formats in which these cards are legal.",
+  "evidence": "the set Hour of Devastation refers to set.name = 'Hour of Devastation'; names of all the cards in the set refers to cards.name; legal cards refers to status = 'Legal'; the formats refers to format",
+  "gold_sql": "SELECT DISTINCT T2.name , CASE WHEN T1.status = 'Legal' THEN T1.format ELSE NULL END FROM legalities AS T1 INNER JOIN cards AS T2 ON T2.uuid = T1.uuid WHERE T2.setCode IN ( SELECT code FROM sets WHERE name = 'Hour of Devastation' )",
+  "bench": "bird"
+ },
+ {
+  "id": 10,
+  "level": "simple",
+  "db_id": "formula_1",
+  "question": "What's the reference name of Marina Bay Street Circuit?",
+  "evidence": "reference name refers to circuitRef; Marina Bay Street Circuit refers to circuits.name = 'Marina Bay Street Circuit'",
+  "gold_sql": "SELECT circuitRef FROM circuits WHERE name = 'Marina Bay Street Circuit'",
+  "bench": "bird"
+ },
+ {
+  "id": 11,
+  "level": "simple",
+  "db_id": "student_club",
+  "question": "Which event has the lowest cost?",
+  "evidence": "event refers to event_name; lowest cost means MIN(cost)",
+  "gold_sql": "SELECT T1.event_name FROM event AS T1 INNER JOIN budget AS T2 ON T1.event_id = T2.link_to_event INNER JOIN expense AS T3 ON T2.budget_id = T3.link_to_budget ORDER BY T3.cost LIMIT 1",
+  "bench": "bird"
+ },
+ {
+  "id": 12,
+  "level": "moderate",
+  "db_id": "debit_card_specializing",
+  "question": "Among the transactions made in the gas stations in the Czech Republic, how many of them are taken place after 2012/1/1?",
+  "evidence": "Czech Republic can be represented as the Country value in the gasstations table is 'CZE'",
+  "gold_sql": "SELECT COUNT(T1.TransactionID) FROM transactions_1k AS T1 INNER JOIN gasstations AS T2 ON T1.GasStationID = T2.GasStationID WHERE T2.Country = 'CZE' AND STRFTIME('%Y', T1.Date) >= '2012'",
+  "bench": "bird"
+ },
+ {
+  "id": 13,
+  "level": "simple",
+  "db_id": "formula_1",
+  "question": "Please give the name of the race held on the circuits in Germany.",
+  "evidence": "Germany is a name of country;",
+  "gold_sql": "SELECT DISTINCT T2.name FROM circuits AS T1 INNER JOIN races AS T2 ON T2.circuitID = T1.circuitId WHERE T1.country = 'Germany'",
+  "bench": "bird"
+ },
+ {
+  "id": 14,
+  "level": "moderate",
+  "db_id": "codebase_community",
+  "question": "State all the tags used by Mark Meckes in his posts that doesn't have comments.",
+  "evidence": "used by Mark Meckes refers to DisplayName = 'Mark Meckes'; Doen't have comments refers to CommentCount = 0;",
+  "gold_sql": "SELECT T3.Tags FROM users AS T1 INNER JOIN postHistory AS T2 ON T1.Id = T2.UserId INNER JOIN posts AS T3 ON T3.Id = T2.PostId WHERE T1.DisplayName = 'Mark Meckes' AND T3.CommentCount = 0",
+  "bench": "bird"
+ },
+ {
+  "id": 15,
+  "level": "moderate",
+  "db_id": "thrombosis_prediction",
+  "question": "For the patients with an abnormal Ig M level, what is the most common disease they are diagnosed with?",
+  "evidence": "abnormal Ig M level refers to IGM <=40 OR IGM >= 400; most common disease refers to MAX(COUNT(Diagnosis));",
+  "gold_sql": "SELECT T1.Diagnosis FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID WHERE T2.IGM NOT BETWEEN 40 AND 400 GROUP BY T1.Diagnosis ORDER BY COUNT(T1.Diagnosis) DESC LIMIT 1",
+  "bench": "bird"
+ },
+ {
+  "id": 16,
+  "level": "simple",
+  "db_id": "california_schools",
+  "question": "Rank schools by their average score in Writing where the score is greater than 499, showing their charter numbers.",
+  "evidence": "Valid charter number means the number is not null",
+  "gold_sql": "SELECT CharterNum, AvgScrWrite, RANK() OVER (ORDER BY AvgScrWrite DESC) AS WritingScoreRank FROM schools AS T1  INNER JOIN satscores AS T2 ON T1.CDSCode = T2.cds WHERE T2.AvgScrWrite > 499 AND CharterNum is not null",
+  "bench": "bird"
+ },
+ {
+  "id": 17,
+  "level": "moderate",
+  "db_id": "student_club",
+  "question": "Based on the total cost for all event, what is the percentage of cost for Yearly Kickoff event?",
+  "evidence": "percentage = DIVIDE(SUM(cost where event_name = 'Yearly Kickoff'), SUM(cost)) * 100",
+  "gold_sql": "SELECT CAST(SUM(CASE WHEN T1.event_name = 'Yearly Kickoff' THEN T3.cost ELSE 0 END) AS REAL) * 100 / SUM(T3.cost) FROM event AS T1 INNER JOIN budget AS T2 ON T1.event_id = T2.link_to_event INNER JOIN expense AS T3 ON T2.budget_id = T3.link_to_budget",
+  "bench": "bird"
+ },
+ {
+  "id": 18,
+  "level": "challenging",
+  "db_id": "toxicology",
+  "question": "What percentage of carcinogenic-type molecules does not contain fluorine?",
+  "evidence": "label = '+' mean molecules are carcinogenic; contain fluorine refers to element = 'f'; percentage = DIVIDE(SUM(element = 'f') * 100, COUNT(molecule_id)) where label = '+'; Should consider the distinct atoms when counting;",
+  "gold_sql": "SELECT CAST(COUNT(DISTINCT CASE WHEN T1.element <> 'f' THEN T2.molecule_id ELSE NULL END) AS REAL) * 100 / COUNT(DISTINCT T2.molecule_id) FROM atom AS T1 INNER JOIN molecule AS T2 ON T1.molecule_id = T2.molecule_id WHERE T2.label = '+'",
+  "bench": "bird"
+ },
+ {
+  "id": 19,
+  "level": "simple",
+  "db_id": "student_club",
+  "question": "What is the highest amount of budget spend for an event?",
+  "evidence": "highest amount of budget spend refers to MAX(spent)",
+  "gold_sql": "SELECT MAX(spent) FROM budget",
+  "bench": "bird"
+ }
+]
