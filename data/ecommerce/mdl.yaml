@@ -9,11 +9,12 @@ models:
     grain: order_item
     key: [order_item_id]
     entity: product
+    scope: {column: shop_id}
     ref_sql: |
       SELECT oi.order_item_id, oi.order_id, oi.product_id, oi.category,
-             oi.amount, o.pay_time
+             oi.amount, o.pay_time, o.shop_id
       FROM order_items oi JOIN orders o ON o.order_id = oi.order_id
-      WHERE o.shop_id = 1 AND o.status = 'paid'
+      WHERE o.status = 'paid'
     columns:
       - {name: order_item_id, unit: 标识}
       - {name: order_id,   unit: 标识}
@@ -21,6 +22,7 @@ models:
       - {name: category,   unit: 文本}
       - {name: amount,     unit: 元}
       - {name: pay_time,   unit: 时间}
+      - {name: shop_id,    unit: 标识, hidden: true}
     dimensions: [category, product_id, pay_time]
 
   - name: products
@@ -42,13 +44,15 @@ models:
     grain: order
     key: [order_id]
     entity: order
+    scope: {column: shop_id}
     ref_sql: |
-      SELECT o.order_id, o.pay_time
+      SELECT o.order_id, o.pay_time, o.shop_id
       FROM orders o
-      WHERE o.shop_id = 1 AND o.status = 'paid'
+      WHERE o.status = 'paid'
     columns:
       - {name: order_id, unit: 标识}
       - {name: pay_time, unit: 时间}
+      - {name: shop_id, unit: 标识, hidden: true}
     dimensions: [pay_time]
 
   - name: shop_traffic
@@ -95,20 +99,66 @@ measures:
     description: 访客数——平台口径 SUM(visitors)，按天×渠道
 
 metrics:
-  - {name: GMV, model: fct_sales_line, measure: sales_amount, unit: 元,
-     description: 商品支付金额}
-  - {name: 支付订单数, model: fct_sales_line, measure: paid_order_count, unit: 单,
-     description: 去重支付订单数}
-  - {name: 订单数订单粒度, model: fct_orders, measure: paid_order_rows, unit: 单,
-     description: 订单粒度模型上的支付订单数（跨模型验证用）}
-  - {name: 访客数, model: shop_traffic, measure: visitor_count, unit: 人,
-     description: 自店访客数（平台口径，MCP 提供）}
+  - name: GMV
+    model: fct_sales_line
+    measure: sales_amount
+    unit: 元
+    description: 商品支付金额
+    owner: 业务负责人(演示)
+    version: 1
+    effective_date: 2026-01-01
+    change_log:
+      - {version: 1, date: 2026-01-01, by: 业务负责人(演示), note: 初始口径}
+  - name: 支付订单数
+    model: fct_sales_line
+    measure: paid_order_count
+    unit: 单
+    description: 去重支付订单数
+    owner: 业务负责人(演示)
+    version: 1
+    effective_date: 2026-01-01
+    change_log:
+      - {version: 1, date: 2026-01-01, by: 业务负责人(演示), note: 初始口径}
+  - name: 订单数订单粒度
+    model: fct_orders
+    measure: paid_order_rows
+    unit: 单
+    description: 订单粒度模型上的支付订单数（跨模型验证用）
+    owner: 业务负责人(演示)
+    version: 1
+    effective_date: 2026-01-01
+    change_log:
+      - {version: 1, date: 2026-01-01, by: 业务负责人(演示), note: 初始口径}
+  - name: 访客数
+    model: shop_traffic
+    measure: visitor_count
+    unit: 人
+    description: 自店访客数（平台口径，MCP 提供）
+    owner: 平台流量负责人(演示)
+    version: 1
+    effective_date: 2026-01-01
+    change_log:
+      - {version: 1, date: 2026-01-01, by: 平台流量负责人(演示), note: 初始口径}
 
 ratios:
-  - {name: 单均金额, expr: GMV / 支付订单数, unit: 元/单,
-     description: 每单平均支付金额}
-  - {name: 转化率, expr: 支付订单数 / 访客数, unit: 单/人,
-     description: 支付订单数÷访客数。跨源比率（本地+平台），公共维度仅 date——按品类拆非法}
+  - name: 单均金额
+    expr: GMV / 支付订单数
+    unit: 元/单
+    description: 每单平均支付金额
+    owner: 业务负责人(演示)
+    version: 1
+    effective_date: 2026-01-01
+    change_log:
+      - {version: 1, date: 2026-01-01, by: 业务负责人(演示), note: 初始口径}
+  - name: 转化率
+    expr: 支付订单数 / 访客数
+    unit: 单/人
+    description: 支付订单数÷访客数。跨源比率（本地+平台），公共维度仅 date——按品类拆非法
+    owner: 平台流量负责人(演示)
+    version: 1
+    effective_date: 2026-01-01
+    change_log:
+      - {version: 1, date: 2026-01-01, by: 平台流量负责人(演示), note: 初始口径}
 
 identities:
   - name: GMV乘法恒等

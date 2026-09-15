@@ -50,6 +50,17 @@
     "must_call_tools": [],
     "must_say": []
    }
+  },
+  {
+   "id": "S3-5-负责人版本",
+   "question": "商品支付金额口径的负责人和版本是什么？",
+   "session": "new",
+   "expect": {
+    "numbers": [1],
+    "conclusion_must_contain": [["业务负责人(演示)", "业务负责人", "负责人"], ["版本", "v1"]],
+    "must_call_tools": [],
+    "must_say": []
+   }
   }
  ]
 }

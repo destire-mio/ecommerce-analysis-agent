@@ -46,6 +46,15 @@ class Registry:
             for c in m["columns"]:
                 if "unit" not in c:
                     raise RegistryError(f"model '{name}' 列 '{c['name']}' 缺 unit")
+                if "hidden" in c and not isinstance(c["hidden"], bool):
+                    raise RegistryError(f"model '{name}' 列 '{c['name']}' hidden 必须是布尔值")
+            scope = m.get("scope")
+            if scope is not None:
+                if not isinstance(scope, dict) or not scope.get("column"):
+                    raise RegistryError(f"model '{name}' scope 必须声明 column")
+                if scope["column"] not in cols:
+                    raise RegistryError(
+                        f"model '{name}' scope 列 '{scope['column']}' 不在 columns 里")
             if "ref_sql" in m and "table" not in m:
                 out = _select_output_columns(m["ref_sql"])
                 if out != cols:
@@ -82,13 +91,50 @@ class Registry:
                 raise RegistryError(f"metric '{name}' 缺少 unit")
             if mt["measure"] not in self.measures:
                 raise RegistryError(f"metric '{name}' 指向未知 measure '{mt['measure']}'")
+            self._validate_caliber("metric", name, mt)
 
         for name, r in self.ratios.items():
             if not r.get("expr") or "unit" not in r or "description" not in r:
                 raise RegistryError(f"ratio '{name}' 缺少 expr/unit/description")
+            self._validate_caliber("ratio", name, r)
 
         self._validate_rules("identity", self.identities, "derived_identity")
         self._validate_rules("reconciliation", self.reconciliations, "reconciliation_rule")
+
+    @staticmethod
+    def _validate_caliber(section: str, name: str, definition: dict):
+        """校验指标口径治理元数据及变更日志的连续性。"""
+        for field in ("owner", "version", "effective_date", "change_log"):
+            if field not in definition:
+                raise RegistryError(f"{section} '{name}' 缺少字段 {field}")
+        for field in ("owner", "effective_date"):
+            if definition[field] in (None, ""):
+                raise RegistryError(f"{section} '{name}' {field} 不能为空")
+        version = definition["version"]
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise RegistryError(f"{section} '{name}' version 必须是正整数")
+        if not isinstance(definition["change_log"], list) or not definition["change_log"]:
+            raise RegistryError(f"{section} '{name}' change_log 必须是非空列表")
+        versions = []
+        for i, entry in enumerate(definition["change_log"], 1):
+            if not isinstance(entry, dict):
+                raise RegistryError(f"{section} '{name}' change_log 第{i}条必须是对象")
+            for field in ("version", "date", "by", "note"):
+                if field not in entry or entry[field] in (None, ""):
+                    raise RegistryError(
+                        f"{section} '{name}' change_log 第{i}条缺少 {field}")
+            ev = entry["version"]
+            if isinstance(ev, bool) or not isinstance(ev, int):
+                raise RegistryError(
+                    f"{section} '{name}' change_log 第{i}条 version 必须是整数")
+            versions.append(ev)
+        expected = list(range(1, version + 1))
+        if versions != expected:
+            raise RegistryError(
+                f"{section} '{name}' change_log version 必须从1连续递增，当前 {versions}")
+        if versions[-1] != version:
+            raise RegistryError(
+                f"{section} '{name}' change_log 最后一条 version 必须等于当前 version {version}")
 
     def _validate_rules(self, section: str, rules: dict, expected_type: str):
         """校验恒等/对账声明的结构；表达式解释仍留给后续能力。"""
@@ -138,6 +184,15 @@ class Registry:
     def all_metric_names(self) -> list:
         return list(self.metrics) + list(self.ratios)
 
+    def visible_columns(self, model_name: str) -> list:
+        """返回模型可对 agent 暴露的列名，hidden 列只供引擎内部使用。"""
+        return [c["name"] for c in self.models[model_name].get("columns", [])
+                if not c.get("hidden", False)]
+
+    def is_hidden(self, model_name: str, column: str) -> bool:
+        return any(c.get("name") == column and c.get("hidden", False)
+                   for c in self.models[model_name].get("columns", []))
+
     def lookup_metric(self, name: str):
         return self.metrics.get(name) or self.ratios.get(name)
 
@@ -156,13 +211,29 @@ def describe(reg: Registry) -> str:
     """生成给 agent 的语义索引(材料包用)——不手写第二份, 防漂移。"""
     lines = ["可用语义模型:"]
     for name, m in reg.models.items():
-        cols = ", ".join(c["name"] for c in m["columns"])
+        cols = ", ".join(reg.visible_columns(name))
         lines.append(f"- {name}(粒度 {m['grain']}): {m.get('description', '')} [列: {cols}]")
     lines.append("可用指标:")
+
+    def caliber_text(definition):
+        history = "；".join(
+            f"v{entry.get('version')} {entry.get('date')} {entry.get('by')}: "
+            f"{entry.get('note')}"
+            for entry in definition.get("change_log", [])
+        )
+        return (
+            f"负责人: {definition.get('owner', '未登记')}; "
+            f"版本: v{definition.get('version', '?')}; "
+            f"生效: {definition.get('effective_date', '未登记')}; "
+            f"变更记录: {history or '未登记'}"
+        )
+
     for name, mt in reg.metrics.items():
-        lines.append(f"- {name}({mt.get('unit', '')}): {mt.get('description', '')}")
+        lines.append(f"- {name}({mt.get('unit', '')}): {mt.get('description', '')} "
+                     f"[{caliber_text(mt)}]")
     for name, r in reg.ratios.items():
-        lines.append(f"- {name}({r.get('unit', '')}): {r.get('description', '')}")
+        lines.append(f"- {name}({r.get('unit', '')}): {r.get('description', '')} "
+                     f"[{caliber_text(r)}]")
     if reg.unavailable:
         lines.append("未开放指标(禁止给数字): " + "、".join(reg.unavailable))
     if reg.identities:

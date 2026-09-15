@@ -22,6 +22,8 @@ from semantic import registry as semantic_registry
 from semantic import planner as semantic_planner
 from semantic import engine as semantic_engine
 from semantic import formulas as semantic_formulas
+from semantic import chart as semantic_chart
+from semantic import metric_changes
 
 _MDL_CACHE = {}
 DATA_ROOT = "data"
@@ -166,11 +168,20 @@ def claim_dir(parent: str, prefix: str) -> str:
 def build_material(db_path: str, db_id: str, skills_dir: str = None) -> str:
     """量材 + 组装: 小库给全部列名, 大库只给表名. 加技能索引与数据覆盖声明."""
     tables = get_tables(db_path)
+    mdl = os.path.join(os.path.dirname(db_path), "mdl.yaml")
+    reg = load_mdl(mdl, db_path=db_path)
+    hidden_cols = {
+        column
+        for model_name in (reg.models if reg else {})
+        for column in reg.models[model_name].get("columns", [])
+        if column.get("hidden", False)
+    }
     conn = sqlite3.connect(db_path)
     try:
         lines = []
         for t in tables:
-            cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{t}")')]
+            cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{t}")')
+                    if r[1] not in hidden_cols]
             lines.append(f"- {t}({', '.join(cols)})")
         text = "\n".join(lines)
     finally:
@@ -188,8 +199,6 @@ def build_material(db_path: str, db_id: str, skills_dir: str = None) -> str:
         idx = "\n".join(f"- [{s['name']}] {s['summary']}（用 read_skill(\"{s['name']}\") 读取全文）"
                         for s in skills)
         material += f"\n\n可用技能(处理对应话题前先读):\n{idx}"
-    mdl = os.path.join(os.path.dirname(db_path), "mdl.yaml")
-    reg = load_mdl(mdl, db_path=db_path)
     if reg is not None:
         material += "\n\n" + semantic_registry.describe(reg)
         material += ("\n\n查询上述标准指标(含平台指标如 访客数)请用 query_metrics 点菜单"
@@ -197,28 +206,50 @@ def build_material(db_path: str, db_id: str, skills_dir: str = None) -> str:
                      "也不要直接调用已登记的平台 MCP 工具(get_shop_traffic 等——"
                      "它们的取数已由语义层接管, 直接调用会被拦截)。"
                      "探索/明细/复杂查询再用 execute_sql 或 peek_*。"
+                     "需要两期对比时，在 query_metrics 里加 compare:{start,end}，"
+                     "直接得到差额/降幅，不要自己查两次相减。"
+                     "要图时用 chart(基于 query_metrics 的 spec)。"
+                     "需要修改口径时只能用 propose_metric_change 提议，不能批准或直接改 mdl.yaml。"
                      "query_metrics 结果中 null = 不适用(分母为0/数据缺失), "
                      "如实转述'不适用', 禁止写 0 或编数。")
+        pending = metric_changes.list_pending(os.path.dirname(db_path))
+        if pending:
+            grouped = {}
+            for draft in pending:
+                grouped.setdefault(draft.get("metric"), []).append(draft.get("id"))
+            notices = "；".join(
+                f"{metric} 口径有 {len(ids)} 条变更待审批(id={','.join(ids)})"
+                for metric, ids in grouped.items()
+            )
+            material += "\n\n待审批口径变更: " + notices
     return material
 
 
 def load_mdl(path: str, db_path: str = None):
-    """加载并缓存语义层(含声明主键的真实唯一性校验); 无文件返回 None."""
+    """加载缓存语义层(含声明主键的真实唯一性校验); 无文件返回 None。
+
+    以 mtime 作为缓存版本，审批脚本改写 mdl.yaml 后同一进程也会重载，
+    避免 agent 继续使用旧口径。
+    """
     if not os.path.exists(path):
         return None
-    if path not in _MDL_CACHE:
-        _MDL_CACHE[path] = semantic_registry.load(path, db_path=db_path)
-    return _MDL_CACHE[path]
+    mtime = os.stat(path).st_mtime_ns
+    cached = _MDL_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    reg = semantic_registry.load(path, db_path=db_path)
+    _MDL_CACHE[path] = (mtime, reg)
+    return reg
 
 
-def run_query_metrics(spec: dict, db_path: str, mcp_bridge=None) -> dict:
+def run_query_metrics(spec: dict, db_path: str, mcp_bridge=None, tenant=1) -> dict:
     """QuerySpec -> 规划器 -> 执行. 规划/校验错误以结构化 payload 回喂 agent."""
     mdl = os.path.join(os.path.dirname(db_path), "mdl.yaml")
     reg = load_mdl(mdl, db_path=db_path)
     if reg is None:
         return {"error": "no_semantic_layer", "reason": f"未找到 {mdl}"}
     try:
-        plan = semantic_planner.Planner(reg).plan(spec)
+        plan = semantic_planner.Planner(reg).plan(spec, tenant=tenant)
         out = semantic_engine.run(plan, db_path, mcp_bridge=mcp_bridge)
         out["sql"] = " ; ".join(out.get("node_sql", []))
         return out
@@ -226,6 +257,59 @@ def run_query_metrics(spec: dict, db_path: str, mcp_bridge=None) -> dict:
         return e.payload
     except semantic_registry.RegistryError as e:
         return {"error": "registry_error", "reason": str(e)}
+
+
+def chart(spec: dict, chart_type: str, x: str, y: str, db_path: str,
+          mcp_bridge=None, tenant=1, _return_query: bool = False) -> dict:
+    """查询标准指标并落盘 ECharts option；``_return_query`` 仅供 dispatch 记 Qn。"""
+    if chart_type not in semantic_chart.chart_types():
+        return {"error": "unknown_chart_type"}
+    query = run_query_metrics(spec, db_path, mcp_bridge=mcp_bridge, tenant=tenant)
+    if query.get("error"):
+        return query
+    if query.get("status") not in ("ok", "empty"):
+        result = {"error": "query_failed", "reason": query.get("status")}
+        if _return_query:
+            result["_query_result"] = query
+        return result
+    columns = query.get("columns") or []
+    if x not in columns:
+        result = {"error": "unknown_chart_column", "column": x,
+                  "available": columns}
+        if _return_query:
+            result["_query_result"] = query
+        return result
+    if y not in columns:
+        result = {"error": "unknown_chart_column", "column": y,
+                  "available": columns}
+        if _return_query:
+            result["_query_result"] = query
+        return result
+    try:
+        option = semantic_chart.to_echarts(columns, query.get("rows") or [],
+                                           chart_type, x, y)
+    except ValueError as exc:
+        code = str(exc)
+        if code == "unknown_chart_type":
+            result = {"error": code}
+        else:
+            result = {"error": "unknown_chart_column", "reason": code}
+        if _return_query:
+            result["_query_result"] = query
+        return result
+
+    os.makedirs("reports", exist_ok=True)
+    chart_id = f"c-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
+    path = os.path.join("reports", chart_id + ".chart.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(option, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    result = {"status": "saved", "path": path, "option": option,
+              "n_rows": query.get("n_rows", len(query.get("rows") or [])),
+              "columns": columns}
+    if _return_query:
+        result["_query_result"] = query
+    return result
 
 
 # ---------------- 工具实现（确定性） ----------------
@@ -559,7 +643,47 @@ def check_report(text: str, executions: dict) -> list:
     return issues
 
 
-def _write_docx(path: str, title: str, body: str, meta: dict):
+def _report_caliber_section(content: str, state: dict, db_path: str = None) -> str:
+    """从报告正文实际引用的 query_metrics Qn 生成口径节，不信任手写指标名。"""
+    body = content.split("###EVIDENCE###", 1)[0]
+    refs = []
+    for number in re.findall(r"\bQ(\d+)\b", body):
+        ref = f"Q{number}"
+        if ref not in refs:
+            refs.append(ref)
+    metric_names = []
+    for ref in refs:
+        entry = state.get("executions", {}).get(ref) or {}
+        if entry.get("tool") != "query_metrics":
+            continue
+        for name in (entry.get("args") or {}).get("metrics") or []:
+            if name not in metric_names:
+                metric_names.append(name)
+    if not metric_names:
+        return ""
+    if db_path is None:
+        db_path = os.path.join(DATA_ROOT, "ecommerce", "ecommerce.sqlite")
+    mdl = os.path.join(os.path.dirname(db_path), "mdl.yaml")
+    reg = load_mdl(mdl, db_path=db_path)
+    if reg is None:
+        return ""
+    lines = ["## 口径说明（由语义层生成）"]
+    for name in metric_names:
+        definition = reg.lookup_metric(name)
+        if not definition:
+            continue
+        lines.append(
+            f"- {name}：{definition.get('description', '')}；"
+            f"单位：{definition.get('unit', '')}；"
+            f"负责人：{definition.get('owner', '未登记')}；"
+            f"版本：v{definition.get('version', '?')}；"
+            f"生效时间：{definition.get('effective_date', '未登记')}"
+        )
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _write_docx(path: str, title: str, body: str, meta: dict,
+                caliber_section: str = ""):
     from docx import Document
     doc = Document()
     doc.add_heading(title or "经营分析报告", level=0)
@@ -575,6 +699,16 @@ def _write_docx(path: str, title: str, body: str, meta: dict):
             doc.add_paragraph(s[2:], style="List Bullet")
         else:
             doc.add_paragraph(s)
+    if caliber_section:
+        doc.add_paragraph("")
+        for line in caliber_section.splitlines():
+            s = line.rstrip()
+            if s.startswith("## "):
+                doc.add_heading(s[3:], level=2)
+            elif s.startswith("- "):
+                doc.add_paragraph(s[2:], style="List Bullet")
+            elif s:
+                doc.add_paragraph(s)
     doc.add_paragraph("")
     doc.add_paragraph(f"数据截止时间: {meta.get('cutoff') or '未取得'}")
     doc.add_paragraph(f"报告ID: {meta['report_id']}  会话: {meta['session']}  生成时间: {meta['created_at']}")
@@ -596,12 +730,17 @@ def save_report(title: str, content: str, state: dict) -> dict:
             "cutoff": state.get("data_cutoff"), "created_at": created,
             "executions": len(state.get("executions", {}))}
     body = content.split("###EVIDENCE###", 1)[0].strip()
+    caliber_section = _report_caliber_section(content, state, state.get("db_path"))
     path = os.path.join("reports", rid + ".docx")
-    _write_docx(path, title, body, meta)
+    _write_docx(path, title, body, meta, caliber_section=caliber_section)
     json.dump(meta, open(os.path.join("reports", rid + ".json"), "w"),
               ensure_ascii=False, indent=1)
     return {"status": "saved", "report_id": rid, "path": path,
-            "cutoff": meta["cutoff"], "note": "报告已落盘为 Word; 最终答复请给用户报告全文"}
+            "cutoff": meta["cutoff"],
+            "caliber_metrics": [
+                name for name in re.findall(r"^- ([^：]+)：", caliber_section, re.M)
+            ],
+            "note": "报告已落盘为 Word; 最终答复请给用户报告全文"}
 
 
 def _norm_num(tok: str):
@@ -692,6 +831,9 @@ def tool_schema() -> list:
                 "time_range": {"type": "object", "properties": {
                     "start": {"type": "string"}, "end": {"type": "string"}},
                     "description": "半开区间 [start,end), 绝对日期 YYYY-MM-DD"},
+                "compare": {"type": "object", "properties": {
+                    "start": {"type": "string"}, "end": {"type": "string"}},
+                    "description": "可选: 基期时间窗(半开区间), 与 time_range 对比。给出后每个指标返回 curr/prev/delta/pct"},
                 "time_grain": {"type": "string", "enum": ["total", "day"]},
                 "filters": {"type": "array", "items": {"type": "object", "properties": {
                     "dimension": {"type": "string"}, "op": {"type": "string"}, "value": {}}}},
@@ -699,6 +841,24 @@ def tool_schema() -> list:
                     "field": {"type": "string"}, "dir": {"type": "string", "enum": ["asc", "desc"]}}}},
                 "limit": {"type": "integer"}},
                 "required": ["metrics", "time_range"]}}},
+        {"type": "function", "function": {
+            "name": "chart",
+            "description": "基于 query_metrics 的结果生成 ECharts 图表配置并落盘。支持 bar/line/pie；数字仍由内部 query_metrics 取数并记入 Qn",
+            "parameters": {"type": "object", "properties": {
+                "spec": {"type": "object", "description": "query_metrics 的 QuerySpec"},
+                "chart_type": {"type": "string", "enum": list(semantic_chart.chart_types())},
+                "x": {"type": "string", "description": "横轴/饼图名称列"},
+                "y": {"type": "string", "description": "数值列(指标名)"}},
+                "required": ["spec", "chart_type", "x", "y"]}}},
+        {"type": "function", "function": {
+            "name": "propose_metric_change",
+            "description": "提议修改指标口径，只写待审批草稿，不会批准或修改 mdl.yaml",
+            "parameters": {"type": "object", "properties": {
+                "metric": {"type": "string"},
+                "field": {"type": "string", "description": "可改字段，如 description/unit/expr"},
+                "new_value": {},
+                "reason": {"type": "string"}},
+                "required": ["metric", "field", "new_value", "reason"]}}},
         {"type": "function", "function": {
             "name": "calculate",
             "description": "具名公式计算器(禁止心算). 派生数(差额/降幅/占比/净贡献/平均/闭合/LMDI乘法归因)必须用它算, 结果会进账本并获 Qn",
@@ -785,6 +945,7 @@ def dispatch(name: str, args: dict, db_path: str, bench: str, db_id: str,
              trace: Trace, turn: int, state: dict) -> dict:
     trace.log("tool_call", turn=turn, name=name, args=args)
     mcp_names = state.get("mcp_tools", {})
+    internal_query = None
     if name == "peek_table":
         result = peek_table(db_path, args["table"], args.get("columns"))
     elif name == "peek_values":
@@ -797,6 +958,23 @@ def dispatch(name: str, args: dict, db_path: str, bench: str, db_id: str,
         result = ask_user(args["question"], args.get("options") or [])
     elif name == "calculate":
         result = calculate(args["formula"], args.get("args") or {}, db_path=db_path)
+    elif name == "chart":
+        result = chart(args.get("spec") or {}, args.get("chart_type"),
+                       args.get("x"), args.get("y"), db_path,
+                       mcp_bridge=state.get("mcp_bridge"),
+                       tenant=state.get("tenant", 1), _return_query=True)
+        internal_query = result.pop("_query_result", None)
+        if internal_query and internal_query.get("status") in ("ok", "empty"):
+            trace.log("execute", turn=turn, tool="query_metrics",
+                      sql=internal_query.get("sql"), n_rows=internal_query.get("n_rows", 0))
+    elif name == "propose_metric_change":
+        try:
+            result = metric_changes.propose(
+                os.path.dirname(db_path), args.get("metric"), args.get("field"),
+                args.get("new_value"), args.get("reason"),
+                state.get("session_id") or "agent")
+        except metric_changes.MetricChangeError as exc:
+            result = {"error": "metric_change_rejected", "reason": str(exc)}
     elif name == "save_report":
         result = save_report(args.get("title", ""), args.get("content", ""), state)
     elif name in mcp_names:
@@ -831,11 +1009,30 @@ def dispatch(name: str, args: dict, db_path: str, bench: str, db_id: str,
             result["sql"] = args["sql"]
             trace.log("execute", turn=turn, sql=args["sql"], n_rows=result.get("n_rows", 0))
     elif name == "query_metrics":
-        result = run_query_metrics(args, db_path, mcp_bridge=state.get("mcp_bridge"))
+        result = run_query_metrics(
+            args, db_path, mcp_bridge=state.get("mcp_bridge"),
+            tenant=state.get("tenant", 1))
         if result.get("status") in ("ok", "empty"):
             trace.log("execute", turn=turn, sql=result.get("sql"), n_rows=result.get("n_rows", 0))
     else:
-        result = {"error": "unknown_tool", "available": ["peek_table", "peek_values", "query_db", "query_metrics", "execute_sql", "find_value", "read_skill", "ask_user", "calculate", "save_report"] + list(mcp_names)}
+        result = {"error": "unknown_tool", "available": ["peek_table", "peek_values", "query_db", "query_metrics", "execute_sql", "find_value", "read_skill", "ask_user", "calculate", "chart", "propose_metric_change", "save_report"] + list(mcp_names)}
+
+    # chart 内部的 query_metrics 没有再绕一遍 dispatch，但仍必须产生同样的 Qn 账本记录。
+    if internal_query and internal_query.get("status") in ("ok", "empty", "no_data"):
+        state["q_count"] += 1
+        ref = f"Q{state['q_count']}"
+        internal_query["query_ref"] = ref
+        result["query_ref"] = ref
+        state["executions"][ref] = {
+            "tool": "query_metrics", "args": args.get("spec") or {},
+            "sql": internal_query.get("sql"),
+            "n_rows": internal_query.get("n_rows"),
+            "columns": internal_query.get("columns") or [],
+            "rows": internal_query.get("rows") or [],
+            "payload": {k: v for k, v in internal_query.items()
+                        if k in ("status", "undefined_cells", "undefined_reasons",
+                                 "undefined_note", "provenance")},
+        }
     # 统一证据编号: 查询/计算结果进账本(存全量行, 供报告对账)
     # no_data 也是证据(数据缺失的 Qn 引用), 与 ok/empty 同级
     if result.get("status") in ("ok", "empty", "no_data") or name in mcp_names:
@@ -890,8 +1087,39 @@ def resolve_db(bench: str, db_id: str) -> str:
     return None
 
 
+def append_audit(question: str, session: str, run_id: str, tenant: int,
+                 executions: dict, status: str, refs=None) -> dict:
+    """追加一条会话审计记录；审计失败不影响用户请求。"""
+    refs = list(refs) if refs is not None else list(executions)
+    current = [executions[ref] for ref in refs if ref in executions]
+    tools_used = []
+    for entry in current:
+        tool = entry.get("tool")
+        if tool and tool not in tools_used:
+            tools_used.append(tool)
+    record = {
+        "ts": datetime.now().isoformat(timespec="milliseconds"),
+        "session": session,
+        "run_id": run_id,
+        "question": question,
+        "tenant": tenant,
+        "tools_used": tools_used,
+        "n_queries": len(current),
+        "status": status,
+    }
+    try:
+        os.makedirs("runs", exist_ok=True)
+        with open(os.path.join("runs", "audit.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except OSError:
+        # 审计是旁路治理能力，不能把已完成的分析变成服务错误。
+        pass
+    return record
+
+
 def run_agent(question: str, bench: str, db_id: str, budget: int = BUDGET,
-              skills_dir: str = SKILLS_DIR, session_id: str = None) -> dict:
+              skills_dir: str = SKILLS_DIR, session_id: str = None,
+              tenant: int = 1) -> dict:
     db_path = resolve_db(bench, db_id)
     if not db_path:
         return {"status": "error", "reason": f"库不存在: {bench}/{db_id}"}
@@ -912,6 +1140,7 @@ def run_agent(question: str, bench: str, db_id: str, budget: int = BUDGET,
     if os.path.exists(exec_file):                    # 会话级连续编号: 第 2 问从上一问的 Qn 继续
         state = json.load(open(exec_file))
     state["session_id"] = sid
+    state["db_path"] = db_path
     state["data_cutoff"] = get_data_cutoff(db_path)
     if os.path.exists(sess_file):
         messages = json.load(open(sess_file))

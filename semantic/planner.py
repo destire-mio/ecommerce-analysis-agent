@@ -7,6 +7,7 @@
 """
 
 from dataclasses import dataclass, field
+import re
 
 AGG_FN = {"sum": "SUM", "avg": "AVG", "max": "MAX", "min": "MIN"}
 
@@ -79,7 +80,13 @@ class Planner:
         return expr
 
     # ---------------- 主流程 ----------------
-    def plan(self, spec: dict) -> Plan:
+    def plan(self, spec: dict, tenant=1) -> Plan:
+        if isinstance(tenant, bool) or not isinstance(tenant, int):
+            raise PlanError("invalid_tenant", reason="tenant 必须是整数")
+        # Planner 可被验收/服务复用；每次计划都从干净的指标 DAG 开始。
+        self._measure_alias = {}
+        self._leaves = {}
+        self._resolved = {}
         metrics = spec.get("metrics") or []
         if not metrics:
             raise PlanError("invalid_spec", reason="metrics 不能为空")
@@ -88,77 +95,127 @@ class Planner:
         if grain not in ("total", "day"):
             raise PlanError("invalid_spec", reason=f"暂不支持 time_grain={grain}")
 
+        compare = spec.get("compare")
+        if compare is not None:
+            if not isinstance(compare, dict) or not compare.get("start") or not compare.get("end"):
+                raise PlanError("invalid_spec", reason="compare 必须包含 start/end")
+            # 两期日期窗无法与按天的行一一对齐；按天对比留给调用方分别查询。
+            if grain == "day":
+                raise PlanError("compare_with_grain",
+                                reason="compare 与 time_grain=day 不能同时使用")
+
         for m in metrics:
             self._resolve(m, [])
 
         models = {leaf["model"] for leaf in self._leaves.values()}
         for d in dims:
             for mo in models:
+                if self.reg.is_hidden(mo, d):
+                    raise PlanError("column_hidden", column=d, model=mo,
+                                    reason=f"模型 {mo} 的列 {d} 已标记为 hidden")
                 if d not in self.reg.models[mo].get("dimensions", []):
                     raise PlanError("dimension_unavailable", dimension=d, model=mo)
+        for f in spec.get("filters") or []:
+            dimension = f.get("dimension")
+            for mo in models:
+                if self.reg.is_hidden(mo, dimension):
+                    raise PlanError("column_hidden", column=dimension, model=mo,
+                                    reason=f"模型 {mo} 的列 {dimension} 已标记为 hidden")
 
         output_dims = list(dims) + (["day"] if grain == "day" else [])
-        align_on = list(output_dims)
+        # compare 时两期要落在同一行；没有 compare 时保留原有按天对齐行为。
+        align_on = list(dims) if compare is not None else list(output_dims)
 
         by_model = {}
         for ms, mdef in self._leaves.items():
             by_model.setdefault(mdef["model"], []).append((ms, mdef))
 
+        # 每个叶子度量都先生成本期 alias(m_0)，对比期使用同一 alias 的
+        # _prev 后缀。这样比率/派生式只需替换叶子别名，不会重复解析指标 DAG。
+        periods = [("", spec.get("time_range") or {})]
+        if compare is not None:
+            periods.append(("_prev", compare))
+
         nodes = []
-        for mo, items in by_model.items():
-            m = self.reg.models[mo]
-            if grain == "day" and "pay_time" not in m.get("dimensions", []) \
-                    and "date" not in m.get("dimensions", []):
-                raise PlanError("time_grain_unavailable", model=mo, time_grain=grain,
-                                reason=f"模型 {mo} 没有时间维度, 无法按 {grain} 拆")
-            if m["provider"] == "platform_mcp":
+        for suffix, time_range in periods:
+            for mo, items in by_model.items():
+                m = self.reg.models[mo]
+                if grain == "day" and "pay_time" not in m.get("dimensions", []) \
+                        and "date" not in m.get("dimensions", []):
+                    raise PlanError("time_grain_unavailable", model=mo, time_grain=grain,
+                                    reason=f"模型 {mo} 没有时间维度, 无法按 {grain} 拆")
+                if m["provider"] == "platform_mcp":
+                    for ms, mdef in items:
+                        tool = m.get("mcp_tool")
+                        if not tool:
+                            raise PlanError("provider_config", model=mo,
+                                            reason="platform_mcp 模型缺 mcp_tool 声明")
+                        # 时间窗: 平台侧时间列固定叫 date; 透传 start/end, 分组 Python 侧做
+                        args = {"start": time_range.get("start"),
+                                "end": time_range.get("end")}
+                        for f in spec.get("filters") or []:
+                            if f["dimension"] in m.get("dimensions", []):
+                                args[f["dimension"]] = f.get("value")
+                        nodes.append(AggNode(
+                            provider="platform_mcp", model=mo, sql="",
+                            output_keys=(["day"] if grain == "day" else [])
+                            + [d for d in dims if d in m.get("dimensions", [])] + [mdef["column"]],
+                            mcp_call={"tool": tool, "args": args},
+                            value_column=mdef["column"],
+                            measure_alias=self._measure_alias[ms] + suffix))
+                    continue
+                if m["provider"] != "sqlite":
+                    raise PlanError("provider_unsupported", provider=m["provider"], model=mo)
+                select, group = [], []
+                if grain == "day":
+                    select.append("DATE(pay_time) AS day")
+                    group.append("DATE(pay_time)")
+                for d in dims:
+                    select.append(d)
+                    group.append(d)
                 for ms, mdef in items:
-                    tool = m.get("mcp_tool")
-                    if not tool:
-                        raise PlanError("provider_config", model=mo,
-                                        reason="platform_mcp 模型缺 mcp_tool 声明")
-                    # 时间窗: 平台侧时间列固定叫 date; 透传 start/end, 分组 Python 侧做
-                    args = {"start": (spec.get("time_range") or {}).get("start"),
-                            "end": (spec.get("time_range") or {}).get("end")}
-                    for f in spec.get("filters") or []:
-                        if f["dimension"] in m.get("dimensions", []):
-                            args[f["dimension"]] = f.get("value")
-                    nodes.append(AggNode(
-                        provider="platform_mcp", model=mo, sql="",
-                        output_keys=(["day"] if grain == "day" else [])
-                        + [d for d in dims if d in m.get("dimensions", [])] + [mdef["column"]],
-                        mcp_call={"tool": tool, "args": args},
-                        value_column=mdef["column"],
-                        measure_alias=self._measure_alias[ms]))
-                continue
-            if m["provider"] != "sqlite":
-                raise PlanError("provider_unsupported", provider=m["provider"], model=mo)
-            select, group = [], []
-            if grain == "day":
-                select.append("DATE(pay_time) AS day")
-                group.append("DATE(pay_time)")
-            for d in dims:
-                select.append(d)
-                group.append(d)
-            for ms, mdef in items:
-                select.append(f"{self._agg_sql(mdef)} AS {self._measure_alias[ms]}")
-            where = self._where(spec.get("time_range") or {}, spec.get("filters") or [])
-            sql = f"SELECT {', '.join(select)} FROM ({m['ref_sql']}) AS {mo}"
-            if where:
-                sql += " WHERE " + " AND ".join(where)
-            if group:
-                sql += " GROUP BY " + ", ".join(group)
-            nodes.append(AggNode(provider="sqlite", model=mo, sql=sql,
-                                 output_keys=align_on + [self._measure_alias[ms] for ms, _ in items]))
+                    alias = self._measure_alias[ms] + suffix
+                    select.append(f"{self._agg_sql(mdef)} AS {alias}")
+                where = self._where(time_range, spec.get("filters") or [],
+                                    scope=m.get("scope"), tenant=tenant)
+                sql = f"SELECT {', '.join(select)} FROM ({m['ref_sql']}) AS {mo}"
+                if where:
+                    sql += " WHERE " + " AND ".join(where)
+                if group:
+                    sql += " GROUP BY " + ", ".join(group)
+                nodes.append(AggNode(
+                    provider="sqlite", model=mo, sql=sql,
+                    output_keys=align_on + [self._measure_alias[ms] + suffix
+                                            for ms, _ in items]))
 
         derived = []
-        for m in metrics:
-            meta = self.reg.ratios.get(m) or self.reg.metrics.get(m) or {}
-            derived.append({"name": m, "expr": self._resolve(m, []), "unit": meta.get("unit", "")})
+        for name in metrics:
+            meta = self.reg.ratios.get(name) or self.reg.metrics.get(name) or {}
+            curr_expr = self._resolve(name, [])
+            if compare is None:
+                derived.append({"name": name, "expr": curr_expr,
+                                "unit": meta.get("unit", "")})
+                continue
+            prev_expr = self._prev_expr(curr_expr)
+            derived.extend([
+                {"name": name, "expr": curr_expr, "unit": meta.get("unit", "")},
+                {"name": f"{name}_prev", "expr": prev_expr, "unit": meta.get("unit", "")},
+                {"name": f"{name}_delta", "expr": f"({curr_expr}) - ({prev_expr})",
+                 "unit": meta.get("unit", "")},
+                {"name": f"{name}_pct",
+                 "expr": f"(({curr_expr}) - ({prev_expr})) / ({prev_expr}) * 100",
+                 "unit": "%"},
+            ])
 
         return Plan(spec=spec, nodes=nodes, align_on=align_on, derived=derived,
                     output_dims=output_dims, order_by=spec.get("order_by") or [],
                     limit=spec.get("limit"))
+
+    def _prev_expr(self, expr: str) -> str:
+        """把已解析的本期叶子 alias 精确替换为对比期 alias。"""
+        for alias in sorted(self._measure_alias.values(), key=len, reverse=True):
+            expr = re.sub(rf"\b{re.escape(alias)}\b", alias + "_prev", expr)
+        return expr
 
     # ---------------- SQL 片段 ----------------
     @staticmethod
@@ -168,8 +225,10 @@ class Planner:
         return f"{AGG_FN[mdef['agg']]}({mdef['column']})"
 
     @staticmethod
-    def _where(tr: dict, filters: list) -> list:
+    def _where(tr: dict, filters: list, scope: dict = None, tenant=1) -> list:
         conds = []
+        if scope:
+            conds.append(f"{scope['column']} = {tenant}")
         if tr.get("start"):
             conds.append(f"pay_time >= '{tr['start']}'")
         if tr.get("end"):

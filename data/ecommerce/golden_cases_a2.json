@@ -1,0 +1,27 @@
+{
+  "note": "A2 compare 两期对比 Golden；数字与工具调用做机器预检，最终答案按语义人工复核。",
+  "cases": [
+    {
+      "id": "A2-1-品类两期变化",
+      "question": "近7天各品类商品支付金额比前7天变化多少？",
+      "session": "new",
+      "expect": {
+        "numbers": [350000, 600000, -250000, 450000, 400000, 50000],
+        "conclusion_must_contain": ["家电", "其他行业"],
+        "must_call_tools": ["query_metrics"],
+        "must_say": []
+      }
+    },
+    {
+      "id": "A2-2-总量降幅",
+      "question": "近7天 GMV 比前7天减少了多少？",
+      "session": "new",
+      "expect": {
+        "numbers": [800000, 1000000, 200000, 20],
+        "conclusion_must_contain": ["减少"],
+        "must_call_tools": ["query_metrics"],
+        "must_say": []
+      }
+    }
+  ]
+}

@@ -41,11 +41,15 @@ def gen(reg: registry.Registry) -> str:
     for name, mt in reg.metrics.items():
         L.append(f"- **{name}**（{mt['unit']}）：{mt.get('description', '')}"
                  f"　← measure `{mt['measure']}`")
+        L.append(f"  - 负责人：{mt.get('owner', '未登记')} ｜ 版本：v{mt.get('version', '?')} ｜ "
+                 f"生效时间：{mt.get('effective_date', '未登记')}")
     L.append("")
     L.append("## 比率（Ratio）")
     for name, r in reg.ratios.items():
         L.append(f"- **{name}**（{r['unit']}）= `{r['expr']}`")
         L.append(f"  - {r.get('description', '')}")
+        L.append(f"  - 负责人：{r.get('owner', '未登记')} ｜ 版本：v{r.get('version', '?')} ｜ "
+                 f"生效时间：{r.get('effective_date', '未登记')}")
     L.append("")
     L.append("## 未开放指标（禁止给数字）")
     for name, u in reg.unavailable.items():

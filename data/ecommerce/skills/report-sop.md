@@ -41,6 +41,7 @@ default: paid_gmv_item
   - `content` = 报告四段正文（含 (Qn) 引用），**不要**包含证据明细
   - 工具会**对账**：每个数字必须能在所引 Qn 的账本记录里找到；返回 `rejected` + `issues` 时，按 issues 修正后重新调用
 - 工具返回 `saved` + Word 路径
+- 口径说明由工具按正文引用的 query_metrics Qn 自动从 mdl.yaml 附在 Word 末尾（含定义、单位、负责人、版本、生效时间）；正文不必手写口径，避免口径名与真实取数不一致
 
 ## 最终答复骨架
 
