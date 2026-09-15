@@ -82,6 +82,7 @@ def main():
     file_val = args[args.index("--file") + 1] if "--file" in args else None
     only = {a for a in args if not a.startswith("--") and a != file_val}
     last_session = None
+    any_failed = False
     for case in cases:
         if only and case["id"] not in only:
             continue
@@ -89,6 +90,7 @@ def main():
         out = run_case(case, last_session)
         last_session = out.get("_session")
         verdict = check(case, out)
+        any_failed = any_failed or not verdict["passed"]
         result = {"case_id": case["id"], "question": case["question"],
                   "status": out.get("status"), "answer": out.get("answer"),
                   "answer_full": out.get("answer_full"), "executions": out.get("executions"),
@@ -99,7 +101,8 @@ def main():
         for k, v in verdict["checks"].items():
             print(f"    {'✓' if v else '✗'} {k}")
         print()
+    return 1 if any_failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

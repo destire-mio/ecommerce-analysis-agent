@@ -171,7 +171,7 @@ def build_material(db_path: str, db_id: str, skills_dir: str = None) -> str:
     mdl = os.path.join(os.path.dirname(db_path), "mdl.yaml")
     reg = load_mdl(mdl, db_path=db_path)
     hidden_cols = {
-        column
+        column["name"]
         for model_name in (reg.models if reg else {})
         for column in reg.models[model_name].get("columns", [])
         if column.get("hidden", False)
@@ -401,12 +401,17 @@ def gate_check(sql: str, db_path: str, bench: str, db_id: str) -> dict:
             conn.close()
     else:
         conn = sqlite3.connect(db_path)
-        conn.execute("PRAGMA query_only=ON")
-        for lit in set(re.findall(r"'([^']*)'", body)):
-            if lit and not lit.isdigit() and len(lit) >= 3:
-                found = conn.execute(
-                    f'SELECT 1 FROM ({body}) LIMIT 0') is not None  # 无索引时跳过字面值预检
-        conn.close()
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            # 没有值索引时只做一次可执行性预检；逻辑模型名/坏 SQL
+            # 应以结构化错误回给 agent，不能让 Flask /ask 变成 HTTP 500。
+            if any(lit and not lit.isdigit() and len(lit) >= 3
+                   for lit in set(re.findall(r"'([^']*)'", body))):
+                conn.execute(f"SELECT 1 FROM ({body}) LIMIT 0")
+        except sqlite3.Error as exc:
+            return {"error": "sql_error", "reason": str(exc)}
+        finally:
+            conn.close()
     return {"ok": True, "sql": body}
 
 
@@ -1035,7 +1040,8 @@ def dispatch(name: str, args: dict, db_path: str, bench: str, db_id: str,
         }
     # 统一证据编号: 查询/计算结果进账本(存全量行, 供报告对账)
     # no_data 也是证据(数据缺失的 Qn 引用), 与 ok/empty 同级
-    if result.get("status") in ("ok", "empty", "no_data") or name in mcp_names:
+    if result.get("status") in ("ok", "empty", "no_data") or name in mcp_names \
+            or name == "chart":
         state["q_count"] += 1
         ref = f"Q{state['q_count']}"
         result["query_ref"] = ref
@@ -1049,7 +1055,7 @@ def dispatch(name: str, args: dict, db_path: str, bench: str, db_id: str,
                                                          "values", "daily", "value", "display",
                                                          "total_delta", "weight", "contributions",
                                                          "shares", "closure", "residual", "warnings",
-                                                         "reconciliation")}}
+                                                         "reconciliation", "option", "path")}}
     result.pop("rows_all", None)
     slim = {k: (v if k != "rows" else v[:3]) for k, v in result.items()}
     trace.log("tool_result", turn=turn, name=name, summary=slim)
@@ -1139,8 +1145,10 @@ def run_agent(question: str, bench: str, db_id: str, budget: int = BUDGET,
     state = {"q_count": 0, "executions": {}}
     if os.path.exists(exec_file):                    # 会话级连续编号: 第 2 问从上一问的 Qn 继续
         state = json.load(open(exec_file))
+    audit_before = set(state.get("executions", {}))
     state["session_id"] = sid
     state["db_path"] = db_path
+    state["tenant"] = tenant
     state["data_cutoff"] = get_data_cutoff(db_path)
     if os.path.exists(sess_file):
         messages = json.load(open(sess_file))
@@ -1223,6 +1231,8 @@ def run_agent(question: str, bench: str, db_id: str, budget: int = BUDGET,
                 f.write(json.dumps({"ts": asked_at, "question": question, "run_id": run_id,
                                     "conclusion": conclusion, "status": "ok"},
                                    ensure_ascii=False) + "\n")
+            append_audit(question, sid, run_id, tenant, state["executions"], "ok",
+                         refs=[ref for ref in state["executions"] if ref not in audit_before])
             return {"status": "ok", "answer": conclusion, "answer_full": msg.content,
                     "turns": turn, "run_id": run_id, "session_id": sid,
                     "executions": state["executions"]}
@@ -1250,6 +1260,8 @@ def run_agent(question: str, bench: str, db_id: str, budget: int = BUDGET,
     with open(os.path.join(sess_dir, "runs.jsonl"), "a") as f:
         f.write(json.dumps({"ts": asked_at, "question": question, "run_id": run_id,
                             "status": "budget_exhausted"}, ensure_ascii=False) + "\n")
+    append_audit(question, sid, run_id, tenant, state["executions"], "budget_exhausted",
+                 refs=[ref for ref in state["executions"] if ref not in audit_before])
     return {"status": "budget_exhausted", "turns": budget, "run_id": run_id, "session_id": sid}
 
 

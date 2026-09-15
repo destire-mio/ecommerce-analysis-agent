@@ -1,8 +1,10 @@
-# Local Python environment and caches
+# Local Python/Node environments and caches
 .venv/
 __pycache__/
 **/__pycache__/
 *.py[cod]
+frontend/node_modules/
+dist/
 
 # Runtime-generated traces, sessions, reports, and evaluation output
 runs/
