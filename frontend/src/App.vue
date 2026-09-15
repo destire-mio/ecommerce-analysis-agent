@@ -10,6 +10,8 @@ const sessionId = ref(null)
 const runId = ref(null)
 const loading = ref(false)
 const error = ref('')
+const approval = ref(null)
+const approvalSeconds = ref(60)
 const chartElements = ref([])
 const chartInstances = []
 const resizeHandlers = []
@@ -53,9 +55,11 @@ async function ask() {
       body: JSON.stringify({ question: text, session_id: sessionId.value }),
     })
     const data = await response.json()
-    if (!response.ok || data.status !== 'ok') {
+    if (!response.ok || !['ok', 'awaiting_sql_approval'].includes(data.status)) {
       throw new Error(data.reason || `请求失败 (${response.status})`)
     }
+    approval.value = data.approval || null
+    approvalSeconds.value = data.approval?.kind === 'extension' ? data.approval.last_seconds + 60 : 60
     answer.value = data.answer || ''
     evidence.value = data.evidence || []
     charts.value = data.charts || []
@@ -64,6 +68,33 @@ async function ask() {
     question.value = ''
   } catch (err) {
     error.value = err.message || '请求失败，请稍后重试'
+  } finally {
+    loading.value = false
+  }
+}
+
+async function decideQuery(decision) {
+  if (!approval.value || loading.value) return
+  loading.value = true
+  error.value = ''
+  try {
+    const response = await fetch('/query-approval', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId.value, id: approval.value.id,
+        decision, seconds: Number(approvalSeconds.value) }),
+    })
+    const data = await response.json()
+    if (!response.ok || !['ok', 'awaiting_sql_approval', 'cancelled'].includes(data.status)) {
+      throw new Error(data.reason || `请求失败 (${data.status})`)
+    }
+    approval.value = data.approval || null
+    approvalSeconds.value = data.approval?.kind === 'extension' ? data.approval.last_seconds + 60 : 60
+    answer.value = data.answer || data.reason || ''
+    evidence.value = data.evidence || []
+    charts.value = data.charts || []
+    runId.value = data.run_id || runId.value
+  } catch (err) {
+    error.value = err.message || '审批请求失败'
   } finally {
     loading.value = false
   }
@@ -88,13 +119,13 @@ onBeforeUnmount(() => {
         v-model="question"
         rows="3"
         placeholder="例如：近7天商品支付金额是多少？"
-        :disabled="loading"
+        :disabled="loading || !!approval"
         @keydown.ctrl.enter="ask"
         @keydown.meta.enter="ask"
       />
       <div class="ask-actions">
         <span class="hint">Ctrl / ⌘ + Enter 发送</span>
-        <button :disabled="loading || !question.trim()" @click="ask">
+        <button :disabled="loading || !!approval || !question.trim()" @click="ask">
           <span v-if="loading" class="spinner" aria-hidden="true" />
           {{ loading ? '分析中…' : '发送问题' }}
         </button>
@@ -102,6 +133,34 @@ onBeforeUnmount(() => {
     </section>
 
     <p v-if="error" class="error" role="alert">{{ error }}</p>
+
+    <section v-if="approval" class="result-card" aria-label="慢查询审批">
+      <h2>{{ approval.kind === 'extension' ? '查询未在批准时间内完成' : '这项分析需要更长的查询时间' }}</h2>
+      <p>{{ approval.question }}</p>
+      <p>涉及数据：{{ approval.tables.join('、') }}。尝试记录：{{ approval.attempts.length }} 次。</p>
+      <p>{{ approval.reason }}。暂停期间没有查询在运行。</p>
+      <details>
+        <summary>查看准备执行的查询</summary>
+        <pre>{{ approval.sql }}</pre>
+        <pre v-if="approval.params?.length">{{ formatDetail(approval.params) }}</pre>
+        <pre>{{ formatDetail(approval.query_plan) }}</pre>
+      </details>
+      <details>
+        <summary>查看此前尝试</summary>
+        <div v-for="(attempt, index) in approval.attempts" :key="index">
+          <p>第 {{ index + 1 }} 次，预算 {{ attempt.timeout_seconds }} 秒</p>
+          <pre>{{ attempt.sql }}</pre>
+          <pre>{{ formatDetail(attempt.query_plan) }}</pre>
+        </div>
+      </details>
+      <label v-if="approval.kind === 'extension'">本次允许执行的秒数
+        <input v-model.number="approvalSeconds" type="number" :min="approval.last_seconds + 1" :disabled="loading" />
+      </label>
+      <div class="ask-actions">
+        <button :disabled="loading" @click="decideQuery('deny')">结束这项任务</button>
+        <button :disabled="loading" @click="decideQuery('approve')">{{ loading ? '执行中…' : `批准这条查询，最多 ${approvalSeconds} 秒` }}</button>
+      </div>
+    </section>
 
     <section v-if="answer" class="result-card" aria-live="polite">
       <div class="section-heading">

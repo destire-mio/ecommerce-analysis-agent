@@ -5,6 +5,7 @@ P1: SQLite; 派生在 Python 侧算(除零返回 None -> 展示"不适用")。
 
 import ast
 import sqlite3
+import sql_control
 
 _ALLOWED = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Name, ast.Load,
             ast.Constant, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv,
@@ -12,14 +13,10 @@ _ALLOWED = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Name, ast.Load,
 
 
 def _run_sql(sql: str, db_path: str):
-    conn = sqlite3.connect(db_path, timeout=3)
-    conn.execute("PRAGMA query_only=ON")
-    try:
-        cur = conn.execute(sql)
-        cols = [d[0] for d in cur.description]
-        return cols, cur.fetchall()
-    finally:
-        conn.close()
+    result = sql_control.execute(sql, db_path)
+    if result.get("error"):
+        raise sql_control.QueryControlError(result)
+    return result["columns"], result["rows_all"]
 
 
 def _run_mcp(node, mcp_bridge):

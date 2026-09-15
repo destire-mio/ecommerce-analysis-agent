@@ -10,11 +10,13 @@ PRODUCT=HERE.parents[1]
 def dump(p,x):p.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding='utf8')
 def sha(p):return hashlib.file_digest(p.open('rb'),'sha256').hexdigest()
 
-def execute(case,data,out,python,timeout,expected):
+def execute(case,data,out,python,timeout,expected,contract=None):
     work=out/case['id'];work.mkdir()
     for path in ['data/ecommerce/skills','data/platform','tools']:(work/path).mkdir(parents=True,exist_ok=True)
     shutil.copy2(PRODUCT/'agent_loop.py',work/'agent_loop.py')
-    shutil.copy2(HERE/'contract.md',work/'data/ecommerce/skills/commerce_contract.md')
+    shutil.copy2(PRODUCT/'sql_control.py',work/'sql_control.py')
+    shutil.copytree(PRODUCT/'semantic',work/'semantic',ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
+    shutil.copy2(contract or HERE/'contract.md',work/'data/ecommerce/skills/commerce_contract.md')
     shutil.copy2(HERE/'platform_mcp.py',work/'tools/platform_mcp.py')
     (work/'data/ecommerce/ecommerce.sqlite').symlink_to(data/'public/warehouse.sqlite')
     (work/'data/platform/platform_data.sqlite').symlink_to(data/'public/platform.sqlite')
@@ -42,6 +44,8 @@ def execute(case,data,out,python,timeout,expected):
     dump(work/'agent_result.json',state)
     (work/'answer.md').write_text(state.get('answer_full','') or '本次未得到最终报告。状态：'+state['status'])
     assessment=grade(case,state,expected)
+    if state['status']=='awaiting_sql_approval':
+        assessment.update(status='AWAITING_APPROVAL',numeric_status='PENDING',evidence_prerequisites='PENDING',numeric_errors=[],invalid_references=[],missing_cited_tables=[])
     assessment.update({'elapsed_seconds':round(time.monotonic()-started,2),'exit_code':proc.returncode,'timeout':timedout,'runtime_sha256':sha(work/'agent_loop.py')})
     # Trace analysis remains useful when the product exhausts its iteration budget.
     events=[]
@@ -66,6 +70,7 @@ def main():
     expected=json.loads((data/'private/expected.json').read_text());manifest=json.loads((data/'manifest.json').read_text())
     if {p.name:sha(p) for p in (data/'public').glob('*.sqlite')}!=manifest['database_sha256']:raise SystemExit('Dataset hash mismatch')
     metadata={'dataset':str(data),'manifest_sha256':sha(data/'manifest.json'),'product_runtime_sha256':sha(PRODUCT/'agent_loop.py'),'adapter_sha256':sha(HERE/'platform_mcp.py'),'contract_sha256':sha(HERE/'contract.md'),'cases_sha256':sha(HERE/'cases.py'),'python':str(args.python),'workers':args.workers,'timeout_seconds':args.timeout,'boundary':'isolated working directory/process, shared host; NOT OS security sandbox or production performance certification; real Agent, benchmark raw-data MCP adapter'}
+    metadata['sql_control_sha256']=sha(PRODUCT/'sql_control.py')
     dump(out/'run_manifest.json',metadata)
     selected=[c for c in CASES if not args.case or c['id'] in args.case];results=[]
     with ThreadPoolExecutor(max_workers=args.workers) as pool:

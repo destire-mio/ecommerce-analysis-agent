@@ -66,6 +66,31 @@ def create_app(runtime_runner=None):
     app = Flask(__name__)
     runner = runtime_runner or run_agent
 
+    def runtime_response(result):
+        evidence, charts = _evidence_and_charts(result.get("executions", {}))
+        response = {"answer": result.get("answer", ""), "evidence": evidence,
+                    "charts": charts, "session_id": result.get("session_id"),
+                    "run_id": result.get("run_id"), "status": result.get("status", "error")}
+        for field in ("reason", "approval"):
+            if result.get(field):
+                response[field] = result[field]
+        return jsonify(response)
+
+    @app.post("/query-approval")
+    def query_approval():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or not isinstance(payload.get("session_id"), str) or not payload["session_id"]:
+            return jsonify(status="error", reason="审批需要 session_id"), 400
+        if not isinstance(payload.get("id"), str) or payload.get("decision") not in ("approve", "deny"):
+            return jsonify(status="error", reason="审批需要 id 和 approve/deny 决定"), 400
+        try:
+            result = runner("", bench="ecommerce", db_id="ecommerce", session_id=payload["session_id"],
+                            approval={"id": payload["id"], "decision": payload["decision"], "seconds": payload.get("seconds", 60)})
+        except Exception as exc:
+            app.logger.exception("query approval failed")
+            return jsonify(status="error", reason=str(exc)), 500
+        return runtime_response(result)
+
     @app.get("/healthz")
     def healthz():
         return jsonify({"status": "ok"})
@@ -101,18 +126,7 @@ def create_app(runtime_runner=None):
             app.logger.exception("agent runtime failed")
             return jsonify({"status": "error", "reason": str(exc)}), 500
 
-        evidence, charts = _evidence_and_charts(result.get("executions", {}))
-        response = {
-            "answer": result.get("answer", ""),
-            "evidence": evidence,
-            "charts": charts,
-            "session_id": result.get("session_id"),
-            "run_id": result.get("run_id"),
-            "status": result.get("status", "error"),
-        }
-        if result.get("reason"):
-            response["reason"] = result["reason"]
-        return jsonify(response)
+        return runtime_response(result)
 
     return app
 

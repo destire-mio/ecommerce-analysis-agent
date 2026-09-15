@@ -1,6 +1,6 @@
 """NL2SQL Agent Loop - agent 层驱动代码.
 
-架构: 预处理(量材) → 材料包 → agent 循环(function calling, 预算≤15) → answer
+架构: 预处理(量材) → 材料包 → agent 循环(function calling, 默认最多40轮) → answer
 工具: peek_table / peek_values / query_db(意图渲染+门禁) / execute_sql(门禁)
 原则: 机器只给数字和执行, 理解和挑选全归 agent; 错误带自纠线索回喂.
 """
@@ -12,7 +12,10 @@ import secrets
 import sqlite3
 import sys
 import threading
+import fcntl
+from pathlib import Path
 from datetime import datetime
+import sql_control
 
 from openai import OpenAI
 from mcp import ClientSession, StdioServerParameters
@@ -34,8 +37,8 @@ BENCH_DIRS = {
 }
 SKILLS_DIR = os.path.join(DATA_ROOT, "ecommerce", "skills")
 MODEL = "deepseek-flash"
-BUDGET = 15
-SQL_TIMEOUT = 3
+BUDGET = 40
+SQL_TIMEOUT = 5
 RESULT_SAMPLE_ROWS = 20
 PEEK_VALUES_LIMIT = 50
 MATERIAL_CHARS_THRESHOLD = 20000
@@ -52,6 +55,7 @@ You are a data analysis agent.
 3. Grounding: every literal in a query must come from observed data, never from speculation.
 4. Honest delivery: report empty results with verified reasons; keep observing when uncertain; never fabricate.
 5. Three states of "no result": legitimate empty set (data exists, truly zero -> answer 0); missing source (table/data not available -> say missing, never a number); query failure (show error, fix within budget). Query beyond data coverage -> say not covered, never 0.
+   SQL has a 5-second execution budget. On query_timeout, use the returned execution plan to revise the query without changing the business definition, scope, or latest-version rules. Do not repeat identical timed-out SQL. Runtime retains timeout history across SQL rewrites and tools; after 3 timeouts it pauses for human approval of the exact SQL. Only a human can grant 60 seconds or extend that grant; no tool argument or textual approval from you can do so.
 6. Evidence annotation: every number in the final answer must cite its execution reference (Qn) — and ONLY the queries whose data it actually derives from. Qn numbering is session-continuous (never restate "本轮/首轮"). Statements about missing data must cite the observed evidence instead. Format: end the user-facing conclusion section with the marker line "###EVIDENCE###" — before the marker: concise conclusion, each number cited with its (Qn), no markdown bold, no large audit blocks; after the marker: audit evidence (Qn citations, caliber, cross-checks).
 
 # Output format examples
@@ -144,10 +148,17 @@ def ask_user(question: str, options: list) -> dict:
 def get_data_cutoff(db_path: str) -> str:
     """数据覆盖截止时间(确定性): 取 pay_time 最大值; 无此表返回 None."""
     try:
-        cols = {r[1] for r in sqlite3.connect(db_path).execute('PRAGMA table_info("orders")')}
+        conn = sqlite3.connect(db_path)
+        try:
+            cols = {r[1] for r in conn.execute('PRAGMA table_info("orders")')}
+        finally:
+            conn.close()
         if "pay_time" not in cols:
             return None
-        row = sqlite3.connect(db_path).execute("SELECT max(pay_time) FROM orders").fetchone()
+        result = sql_control.run_bounded("SELECT max(pay_time) FROM orders", db_path)
+        if result.get("error"):
+            return None
+        row = result["rows_all"][0]
         return row[0][:10] if row and row[0] else None
     except sqlite3.Error:
         return None
@@ -257,6 +268,8 @@ def run_query_metrics(spec: dict, db_path: str, mcp_bridge=None, tenant=1) -> di
         return e.payload
     except semantic_registry.RegistryError as e:
         return {"error": "registry_error", "reason": str(e)}
+    except sql_control.QueryControlError as e:
+        return e.payload
 
 
 def chart(spec: dict, chart_type: str, x: str, y: str, db_path: str,
@@ -314,6 +327,12 @@ def chart(spec: dict, chart_type: str, x: str, y: str, db_path: str,
 
 # ---------------- 工具实现（确定性） ----------------
 
+def _bounded_rows(sql, db_path, params=()):
+    result = sql_control.execute(sql, db_path, params)
+    if result.get("error"):
+        raise sql_control.QueryControlError(result)
+    return result["rows_all"]
+
 def peek_table(db_path: str, table: str, columns: list = None) -> dict:
     tables = get_tables(db_path)
     if table not in tables:
@@ -333,13 +352,11 @@ def peek_table(db_path: str, table: str, columns: list = None) -> dict:
                 seen.add(entry)
                 fks.append(entry)
         stats = []
-        total = conn.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
+        total = _bounded_rows(f'SELECT count(*) FROM "{table}"', db_path)[0][0]
         for c in wanted:
-            d = conn.execute(f'SELECT count(DISTINCT "{c}") FROM "{table}"').fetchone()[0]
-            nn = conn.execute(f'SELECT count("{c}") FROM "{table}"').fetchone()[0]
-            avg = conn.execute(
-                f'SELECT avg(length(CAST("{c}" AS TEXT))) FROM "{table}" WHERE "{c}" IS NOT NULL'
-            ).fetchone()[0] or 0
+            d, nn, avg = _bounded_rows(
+                f'SELECT count(DISTINCT "{c}"),count("{c}"),avg(length(CAST("{c}" AS TEXT))) FROM "{table}"', db_path)[0]
+            avg = avg or 0
             stats.append(f"  {c}: 不同值{d}, 非空率{round(nn*100/total,1) if total else 0}%, 平均长度{int(avg)}")
         return {"table": table, "外键": fks, "列统计": stats}
     finally:
@@ -347,21 +364,21 @@ def peek_table(db_path: str, table: str, columns: list = None) -> dict:
 
 
 def peek_values(db_path: str, table: str, column: str, keyword: str = None) -> dict:
-    cols = [r[1] for r in sqlite3.connect(db_path).execute(f'PRAGMA table_info("{table}")')]
-    if column not in cols:
-        return {"error": "unknown_column", "available_columns": cols}
     conn = sqlite3.connect(db_path)
     try:
+        cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')]
+        if column not in cols:
+            return {"error": "unknown_column", "available_columns": cols}
         if keyword:
-            rows = conn.execute(
+            rows = _bounded_rows(
                 f'SELECT DISTINCT CAST("{column}" AS TEXT) FROM "{table}" '
                 f'WHERE "{column}" IS NOT NULL AND CAST("{column}" AS TEXT) LIKE ? LIMIT ?',
-                (f"%{keyword}%", PEEK_VALUES_LIMIT)).fetchall()
+                db_path, (f"%{keyword}%", PEEK_VALUES_LIMIT))
         else:
-            rows = conn.execute(
+            rows = _bounded_rows(
                 f'SELECT DISTINCT CAST("{column}" AS TEXT) FROM "{table}" '
-                f'WHERE "{column}" IS NOT NULL LIMIT ?', (PEEK_VALUES_LIMIT,)).fetchall()
-        d = conn.execute(f'SELECT count(DISTINCT "{column}") FROM "{table}"').fetchone()[0]
+                f'WHERE "{column}" IS NOT NULL LIMIT ?', db_path, (PEEK_VALUES_LIMIT,))
+        d = _bounded_rows(f'SELECT count(DISTINCT "{column}") FROM "{table}"', db_path)[0][0]
         out = {"table": table, "column": column, "total_distinct": d,
                "values": [r[0][:80] for r in rows]}
         if d > len(rows):
@@ -376,8 +393,15 @@ def gate_check(sql: str, db_path: str, bench: str, db_id: str) -> dict:
     if not body:
         return {"error": "sql_rejected", "reason": "空 SQL"}
     head = body.split(None, 1)[0].upper()
-    if head != "SELECT":
+    if head not in ("SELECT", "WITH"):
         return {"error": "sql_rejected", "reason": f"只允许 SELECT, 收到: {head}"}
+    try:
+        from sqlglot import parse, exp
+        trees = parse(body, read="sqlite")
+        if len(trees) != 1 or not isinstance(trees[0], exp.Query):
+            return {"error": "sql_rejected", "reason": "只允许一条只读查询"}
+    except Exception as exc:
+        return {"error": "sql_error", "reason": str(exc)}
     if ";" in body:
         return {"error": "sql_rejected", "reason": "禁止多语句"}
     upper = body.upper()
@@ -417,31 +441,7 @@ def gate_check(sql: str, db_path: str, bench: str, db_id: str) -> dict:
 
 def run_sql(sql: str, db_path: str) -> dict:
     body = sql.strip().removeprefix("```sql").removesuffix("```").strip().rstrip(";")
-    conn = sqlite3.connect(db_path, timeout=SQL_TIMEOUT)
-    conn.execute("PRAGMA query_only=ON")
-    result = []
-    timer = threading.Timer(SQL_TIMEOUT, lambda: result.append(("timeout", None, None)))
-    timer.start()
-    try:
-        cur = conn.execute(body)
-        result.append(("ok", cur.fetchall(), [d[0] for d in (cur.description or [])]))
-    except sqlite3.Error as e:
-        result.append(("error", str(e), None))
-    finally:
-        timer.cancel()
-        conn.close()
-    kind, payload, cols = result[0]
-    if kind == "timeout":
-        return {"error": "timeout", "reason": f"超过 {SQL_TIMEOUT}s"}
-    if kind == "error":
-        return {"error": "sql_error", "reason": payload}
-    out = {"status": "empty" if not payload else "ok", "n_rows": len(payload),
-           "columns": cols or [], "rows_all": payload or []}
-    if payload:
-        out["rows"] = payload if len(payload) <= RESULT_SAMPLE_ROWS else payload[:5]
-        if len(payload) > RESULT_SAMPLE_ROWS:
-            out["note"] = f"共 {len(payload)} 行, 此为前 5 行"
-    return out
+    return sql_control.execute(body, db_path)
 
 
 def render_intent(intent: dict, db_path: str) -> dict:
@@ -769,6 +769,9 @@ class Trace:
             ensure_ascii=False, default=str) + "\n")
         self.fh.flush()
 
+    def close(self):
+        self.fh.close()
+
 
 def tool_schema() -> list:
     return [
@@ -915,34 +918,50 @@ class McpBridge:
         import threading
         self._loop = asyncio.new_event_loop()
         self._ready = threading.Event()
-        t = threading.Thread(target=self._run, daemon=True)
-        t.start()
+        self._error = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
         self._ready.wait(timeout=30)
+        if self._error or not self._ready.is_set():
+            raise RuntimeError(f"MCP 初始化失败: {self._error or 'timeout'}")
         return self.tools
 
     def _run(self):
         import asyncio
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._connect())
-        self._loop.run_forever()
+        try:
+            self._loop.run_until_complete(self._connect())
+        except Exception as exc:
+            self._error = str(exc)
+            self._ready.set()
+        finally:
+            self._loop.close()
 
     async def _connect(self):
         from mcp import ClientSession
         from mcp.client.stdio import stdio_client
-        self._client_cm = stdio_client(self._params)
-        read, write = await self._client_cm.__aenter__()
-        self._session_cm = ClientSession(read, write)
-        self._session = await self._session_cm.__aenter__()
-        await self._session.initialize()
-        listing = await self._session.list_tools()
-        self.tools = [{"name": t.name, "description": t.description or "",
-                       "parameters": t.inputSchema} for t in listing.tools]
+        import asyncio
+        self._stop = asyncio.Event()
+        async with stdio_client(self._params) as (read, write):
+            async with ClientSession(read, write) as session:
+                self._session = session
+                await session.initialize()
+                listing = await session.list_tools()
+                self.tools = [{"name": t.name, "description": t.description or "",
+                               "parameters": t.inputSchema} for t in listing.tools]
+                self._ready.set()
+                await self._stop.wait()
 
-    def call(self, name: str, args: dict) -> dict:
+    def close(self):
+        if self._loop and not self._loop.is_closed() and hasattr(self, "_stop"):
+            self._loop.call_soon_threadsafe(self._stop.set)
+            self._thread.join(timeout=10)
+
+    def call(self, name: str, args: dict, timeout=60) -> dict:
         import asyncio
         fut = asyncio.run_coroutine_threadsafe(
             self._session.call_tool(name, args), self._loop)
-        result = fut.result(timeout=60)
+        result = fut.result(timeout=timeout)
         return json.loads(result.content[0].text)
 
 
@@ -995,6 +1014,11 @@ def dispatch(name: str, args: dict, db_path: str, bench: str, db_id: str,
                               '{"metrics": ["访客数"], "time_range": {"start": "...", "end": "..."}}；'
                               "指标名见材料包'可用指标'。"),
                       "note": "口径/单位/维度由语义层保证; 直接调用会绕过这些保证, 故被拦截"}
+        elif name == "query_platform" and os.path.exists("data/platform/platform_data.sqlite"):
+            # Adapter budget is runtime-owned, never accepted from LLM arguments.
+            result = sql_control.execute(args["sql"], "data/platform/platform_data.sqlite", limit=200,
+                runner=lambda seconds: state["mcp_bridge"].call(name,
+                    {"sql": args["sql"], "timeout_seconds": seconds}, timeout=seconds+5))
         else:
             result = state["mcp_bridge"].call(name, args)
     elif name == "query_db":
@@ -1125,12 +1149,32 @@ def append_audit(question: str, session: str, run_id: str, tenant: int,
 
 def run_agent(question: str, bench: str, db_id: str, budget: int = BUDGET,
               skills_dir: str = SKILLS_DIR, session_id: str = None,
-              tenant: int = 1) -> dict:
+              tenant: int = 1, approval: dict = None, resume: bool = False) -> dict:
+    """One owner per session; approval is a trusted UI/CLI input, never an LLM tool."""
+    sid = session_id or claim_dir("sessions", "s")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", sid):
+        return {"status": "error", "reason": "非法会话标识"}
+    os.makedirs(os.path.join("sessions", sid), exist_ok=True)
+    bridges = []
+    with open(os.path.join("sessions", sid, ".lock"), "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"status": "busy", "reason": "该会话正在执行，不能并发审批或重试", "session_id": sid}
+        try:
+            return _run_agent(question, bench, db_id, budget, skills_dir, sid, tenant, approval, bridges, resume)
+        finally:
+            for bridge in bridges:
+                bridge.close()
+
+
+def _run_agent(question, bench, db_id, budget, skills_dir, session_id, tenant, approval, bridges, resume=False):
     db_path = resolve_db(bench, db_id)
     if not db_path:
         return {"status": "error", "reason": f"库不存在: {bench}/{db_id}"}
     run_id = claim_dir("runs", "run")
     trace = Trace(os.path.join("runs", run_id, "trace.jsonl"))
+    bridges.append(trace)  # all run-owned resources close on every return/exception
     asked_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     trace.log("start", question=question, db_id=db_id, bench=bench)
 
@@ -1140,20 +1184,26 @@ def run_agent(question: str, bench: str, db_id: str, budget: int = BUDGET,
     os.makedirs(sess_dir, exist_ok=True)
     sess_file = os.path.join(sess_dir, "messages.json")
     exec_file = os.path.join(sess_dir, "executions.json")
+    checkpoint = Path(sess_dir) / "runtime.json"
+    saved = json.loads(checkpoint.read_text()) if checkpoint.exists() else None
     sys_prompt = SYSTEM_PROMPT.format(
         database_context=f"当前数据库: SQLite, 库名 {db_id}。方言以 SQLite 为准。")
     state = {"q_count": 0, "executions": {}}
     if os.path.exists(exec_file):                    # 会话级连续编号: 第 2 问从上一问的 Qn 继续
-        state = json.load(open(exec_file))
+        state = json.loads(Path(exec_file).read_text())
+    if saved:
+        state = saved["state"]
+    origin = {"bench": bench, "db_id": db_id, "tenant": tenant, "db_path": str(Path(db_path).resolve())}
+    if state.get("request_origin") and state["request_origin"] != origin:
+        return {"status": "error", "reason": "会话数据源或店铺不匹配，请使用原会话范围", "session_id": sid}
+    state["request_origin"] = origin
     audit_before = set(state.get("executions", {}))
     state["session_id"] = sid
     state["db_path"] = db_path
     state["tenant"] = tenant
     state["data_cutoff"] = get_data_cutoff(db_path)
-    if os.path.exists(sess_file):
-        messages = json.load(open(sess_file))
-        messages.append({"role": "user",
-                         "content": f"追问: {question}\n[提问时间: {asked_at}]"})
+    if saved or os.path.exists(sess_file):
+        messages = saved["messages"] if saved else json.loads(Path(sess_file).read_text())
         resumed = True
     else:
         messages = [
@@ -1163,6 +1213,61 @@ def run_agent(question: str, bench: str, db_id: str, budget: int = BUDGET,
                         + f"\n\n[提问时间: {asked_at}]"},
         ]
         resumed = False
+    pending = state.get("query_control", {}).get("pending")
+    if resume and (not saved or not messages or messages[-1]["role"] != "tool"):
+        return {"status": "error", "reason": "没有等待模型继续处理的执行检查点", "session_id": sid}
+    # Runtime-authored approval calls contain no model reasoning. Repair only
+    # those legacy messages; never invent missing reasoning for model messages.
+    for message in messages:
+        calls = message.get("tool_calls") or []
+        if message["role"] == "assistant" and calls and all(c["id"].startswith("approved-") for c in calls):
+            message.setdefault("reasoning_content", "")
+    if not pending and approval:
+        return {"status": "error", "reason": "审批不存在或已使用", "session_id": sid}
+    if not pending and not resume:
+        if resumed:
+            messages.append({"role": "user", "content": f"追问: {question}\n[提问时间: {asked_at}]"})
+        state["query_control"] = {}
+        state["request_question"], state["request_budget"], state["used_turns"] = question, budget, 0
+    else:
+        question = state["request_question"]
+        budget = state["request_budget"]
+    control = sql_control.Controller(state["query_control"], question, trace)
+
+    def persist():
+        clean = {k: v for k, v in state.items() if k not in ("mcp_bridge", "mcp_tools")}
+        temp = checkpoint.with_suffix(".tmp")
+        temp.write_text(json.dumps({"state": clean, "messages": messages}, ensure_ascii=False, default=str))
+        os.replace(temp, checkpoint)
+        Path(exec_file).write_text(json.dumps(clean, ensure_ascii=False, default=str))
+        Path(sess_file).write_text(json.dumps(messages, ensure_ascii=False, default=str))
+
+    def paused():
+        persist()
+        ticket = state["query_control"]["pending"]
+        trace.log("end", status="awaiting_sql_approval", approval_id=ticket["id"])
+        return {"status": "awaiting_sql_approval", "approval": ticket,
+                "reason": ticket["reason"], "session_id": sid, "run_id": run_id,
+                "turns": state["used_turns"], "executions": state["executions"]}
+
+    if pending and not approval:
+        return paused()
+    if pending:
+        if approval.get("id") != pending["id"]:
+            return {"status": "error", "reason": "审批标识不匹配", "session_id": sid}
+        if approval.get("decision") == "deny":
+            del state["query_control"]["pending"]
+            state.pop("pending_tool", None)
+            messages.append({"role": "user", "content": "用户结束了当前慢查询任务。"})
+            persist()
+            return {"status": "cancelled", "reason": "用户结束了慢查询任务", "session_id": sid, "run_id": run_id}
+        if approval.get("decision") != "approve":
+            return {"status": "error", "reason": "审批决定必须为 approve 或 deny", "session_id": sid}
+        try:
+            control.approve(approval["id"], approval.get("seconds", sql_control.LONG_SECONDS))
+        except ValueError as exc:
+            return {"status": "error", "reason": str(exc), "session_id": sid}
+        persist()  # consume ticket before executing: replay never grants another long run
     trace.log("session", sid=sid, resumed=resumed)
     client = OpenAI(api_key=os.environ["DEEPSEEK_API_KEY"], base_url="https://api.deepseek.com")
 
@@ -1172,6 +1277,7 @@ def run_agent(question: str, bench: str, db_id: str, budget: int = BUDGET,
     mcp_server = os.path.join("tools", "platform_mcp.py")
     if os.path.exists(mcp_server) and os.path.exists("data/platform/platform_data.sqlite"):
         bridge = McpBridge(sys.executable, ["tools/platform_mcp.py"], cwd=".")
+        bridges.append(bridge)
         mcp_tools = bridge.start()
         state["mcp_bridge"] = bridge
         state["mcp_tools"] = {t["name"]: t for t in mcp_tools}
@@ -1179,11 +1285,36 @@ def run_agent(question: str, bench: str, db_id: str, budget: int = BUDGET,
             "name": t["name"], "description": t["description"], "parameters": t["parameters"]}}
             for t in mcp_tools]
         trace.log("mcp_connect", tools=[t["name"] for t in mcp_tools])
+        for tool in extra_tools:
+            params = tool["function"]["parameters"]
+            params.get("properties", {}).pop("timeout_seconds", None)
+            if "required" in params:
+                params["required"] = [k for k in params["required"] if k != "timeout_seconds"]
+
+    def controlled_dispatch(name, args, turn):
+        try:
+            with sql_control.scope(control):
+                return dispatch(name, args, db_path, bench, db_id, trace, turn, state)
+        except sql_control.QueryControlError as exc:
+            trace.log("tool_result", turn=turn, name=name, summary=exc.payload)
+            return exc.payload
+
+    if pending:
+        tool = state["pending_tool"]
+        call_id = "approved-" + secrets.token_hex(8)
+        messages.append({"role": "assistant", "content": "按用户审批重跑指定查询。", "reasoning_content": "", "tool_calls": [
+            {"id": call_id, "type": "function", "function": {"name": tool["name"], "arguments": json.dumps(tool["args"], ensure_ascii=False)}}]})
+        result = controlled_dispatch(tool["name"], tool["args"], state["used_turns"])
+        messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(result, ensure_ascii=False)})
+        if control.state.get("pending"):
+            return paused()
+        state.pop("pending_tool", None)
+        persist()
 
     last_error_sig, error_repeat = None, 0
     validation_bounced = 0
     report_saved_this_run = False
-    for turn in range(1, budget + 1):
+    for turn in range(state["used_turns"] + 1, budget + 1):
         resp = client.chat.completions.create(
             model=MODEL, messages=messages, tools=tool_schema() + extra_tools, temperature=0)
         msg = resp.choices[0].message
@@ -1191,9 +1322,12 @@ def run_agent(question: str, bench: str, db_id: str, budget: int = BUDGET,
         trace.log("llm", turn=turn,
                   usage={"p": usage.prompt_tokens, "c": usage.completion_tokens} if usage else None)
         assistant_msg = {"role": "assistant", "content": msg.content or ""}
+        if getattr(msg, "reasoning_content", None) is not None:
+            assistant_msg["reasoning_content"] = msg.reasoning_content
         if msg.tool_calls:
             assistant_msg["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
         messages.append(assistant_msg)
+        state["used_turns"] = turn
 
         if not msg.tool_calls:
             if last_error_sig:
@@ -1225,14 +1359,13 @@ def run_agent(question: str, bench: str, db_id: str, budget: int = BUDGET,
             evidence = parts[1].strip()
             trace.log("report", conclusion=conclusion, evidence=evidence,
                       executions=state["executions"])
-            json.dump(messages, open(sess_file, "w"), ensure_ascii=False, default=str)
-            json.dump(state, open(exec_file, "w"), ensure_ascii=False, default=str)
             with open(os.path.join(sess_dir, "runs.jsonl"), "a") as f:
                 f.write(json.dumps({"ts": asked_at, "question": question, "run_id": run_id,
                                     "conclusion": conclusion, "status": "ok"},
                                    ensure_ascii=False) + "\n")
             append_audit(question, sid, run_id, tenant, state["executions"], "ok",
                          refs=[ref for ref in state["executions"] if ref not in audit_before])
+            persist()
             return {"status": "ok", "answer": conclusion, "answer_full": msg.content,
                     "turns": turn, "run_id": run_id, "session_id": sid,
                     "executions": state["executions"]}
@@ -1240,7 +1373,13 @@ def run_agent(question: str, bench: str, db_id: str, budget: int = BUDGET,
         for tc in msg.tool_calls:
             name = tc.function.name
             args = json.loads(tc.function.arguments)
-            result = dispatch(name, args, db_path, bench, db_id, trace, turn, state)
+            if control.state.get("pending"):
+                result = {"error": "deferred_for_approval", "reason": "等待人工审批，本批剩余工具未执行；恢复后按需要重新查询"}
+                trace.log("tool_skipped", turn=turn, name=name, args=args, reason="awaiting_sql_approval")
+            else:
+                result = controlled_dispatch(name, args, turn)
+                if control.state.get("pending"):
+                    state["pending_tool"] = {"name": name, "args": args}
             if name == "save_report" and result.get("status") == "saved":
                 report_saved_this_run = True
             sig = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
@@ -1253,15 +1392,17 @@ def run_agent(question: str, bench: str, db_id: str, budget: int = BUDGET,
                 last_error_sig, error_repeat = None, 0
             messages.append({"role": "tool", "tool_call_id": tc.id,
                              "content": json.dumps(result, ensure_ascii=False, default=str)})
+        persist()
+        if control.state.get("pending"):
+            return paused()
 
     trace.log("end", status="budget_exhausted")
-    json.dump(messages, open(sess_file, "w"), ensure_ascii=False, default=str)
-    json.dump(state, open(exec_file, "w"), ensure_ascii=False, default=str)
     with open(os.path.join(sess_dir, "runs.jsonl"), "a") as f:
         f.write(json.dumps({"ts": asked_at, "question": question, "run_id": run_id,
                             "status": "budget_exhausted"}, ensure_ascii=False) + "\n")
     append_audit(question, sid, run_id, tenant, state["executions"], "budget_exhausted",
                  refs=[ref for ref in state["executions"] if ref not in audit_before])
+    persist()
     return {"status": "budget_exhausted", "turns": budget, "run_id": run_id, "session_id": sid}
 
 
@@ -1272,7 +1413,16 @@ def main():
         db_id = argv[argv.index("--db") + 1]
         bench = argv[argv.index("--bench") + 1] if "--bench" in argv else "bird"
         session = argv[argv.index("--session") + 1] if "--session" in argv else None
-        out = run_agent(question, bench, db_id, session_id=session)
+        approval = None
+        if "--approve-query" in argv or "--deny-query" in argv:
+            if not session:
+                raise SystemExit("审批需要 --session")
+            flag = "--approve-query" if "--approve-query" in argv else "--deny-query"
+            approval = {"id": argv[argv.index(flag)+1], "decision": "approve" if flag == "--approve-query" else "deny",
+                        "seconds": float(argv[argv.index("--query-seconds")+1]) if "--query-seconds" in argv else sql_control.LONG_SECONDS}
+        if "--resume" in argv and not session:
+            raise SystemExit("恢复执行需要 --session")
+        out = run_agent(question, bench, db_id, session_id=session, approval=approval, resume="--resume" in argv)
         print(json.dumps(out, ensure_ascii=False, default=str))
         return 0 if out["status"] == "ok" else 1
     print("用法: python3 agent_loop.py --question <问题> --db <库名> [--bench bird] [--session <会话id>]")
