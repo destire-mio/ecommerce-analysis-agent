@@ -21,3 +21,6 @@ data/*.zip
 
 # OS/editor files
 .DS_Store
+
+# Local collaboration instructions (kept outside the public repository)
+AGENTS.md
