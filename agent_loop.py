@@ -1233,6 +1233,21 @@ def _run_agent(question, bench, db_id, budget, skills_dir, session_id, tenant, a
         question = state["request_question"]
         budget = state["request_budget"]
     control = sql_control.Controller(state["query_control"], question, trace)
+    # Old table-based groups may have blocked an unrelated query before it ran.
+    # Reclassify that checkpoint and retry only with the normal short budget.
+    released = control.released_pending
+    if released:
+        if approval and approval.get("id") != released["id"]:
+            return {"status": "error", "reason": "审批标识不匹配", "session_id": sid}
+        if approval and approval.get("decision") not in ("approve", "deny"):
+            return {"status": "error", "reason": "审批决定必须为 approve 或 deny", "session_id": sid}
+        if approval and approval.get("decision") == "deny":
+            state.pop("pending_tool", None)
+            # Keep the normal cancellation path below, without granting time.
+            control.state["pending"] = released
+            pending = released
+        else:
+            pending = None
 
     def persist():
         clean = {k: v for k, v in state.items() if k not in ("mcp_bridge", "mcp_tools")}
@@ -1299,10 +1314,10 @@ def _run_agent(question, bench, db_id, budget, skills_dir, session_id, tenant, a
             trace.log("tool_result", turn=turn, name=name, summary=exc.payload)
             return exc.payload
 
-    if pending:
+    if pending or (released and state.get("pending_tool")):
         tool = state["pending_tool"]
-        call_id = "approved-" + secrets.token_hex(8)
-        messages.append({"role": "assistant", "content": "按用户审批重跑指定查询。", "reasoning_content": "", "tool_calls": [
+        call_id = ("recovered-" if released else "approved-") + secrets.token_hex(8)
+        messages.append({"role": "assistant", "content": "按修正后的分组使用5秒预算执行未运行查询。" if released else "按用户审批重跑指定查询。", "reasoning_content": "", "tool_calls": [
             {"id": call_id, "type": "function", "function": {"name": tool["name"], "arguments": json.dumps(tool["args"], ensure_ascii=False)}}]})
         result = controlled_dispatch(tool["name"], tool["args"], state["used_turns"])
         messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(result, ensure_ascii=False)})

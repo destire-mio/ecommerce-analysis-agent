@@ -15,7 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from sqlglot.errors import ParseError
+from sqlglot.errors import SqlglotError
 
 SHORT_SECONDS = 5
 LONG_SECONDS = 60
@@ -47,6 +47,96 @@ def source_tables(sql):
     tree = parse_one(sql, read="sqlite")
     ctes = {n.alias_or_name.lower() for n in tree.find_all(exp.CTE)}
     return sorted({t.name.lower() for t in tree.find_all(exp.Table) if t.name.lower() not in ctes})
+
+
+def recovery_signature(sql):
+    """Result-shape grouping, not a proof of SQL/business equivalence.
+
+    Resolve output columns through aliases/CTEs. Keep aggregates, DISTINCT and
+    grouping dimensions; ignore literals, filters, ordering and LIMIT so routine
+    optimization does not buy another retry budget. Pure calculations keep their
+    own database-local group. The request's turn budget bounds shape changes.
+    """
+    from sqlglot import exp, parse_one
+    from sqlglot.optimizer.scope import Scope, build_scope
+    tables = source_tables(sql)
+    if not tables:
+        return {"tables": [], "outputs": ["calculation"]}
+    root = build_scope(parse_one(sql, read="sqlite"))
+
+    def ordered(values):
+        unique = {json.dumps(v, sort_keys=True): v for v in values}
+        return [unique[k] for k in sorted(unique)]
+
+    def describe(node, scope, visiting=frozenset()):
+        if isinstance(node, exp.Alias):
+            return describe(node.this, scope, visiting)
+        if isinstance(node, exp.Column):
+            name = node.name.lower()
+            sources = {k.lower(): v[1] for k, v in scope.selected_sources.items()}
+            targets = ([sources[node.table.lower()]] if node.table.lower() in sources
+                       else list(sources.values()))
+            resolved = []
+            for source in targets:
+                if isinstance(source, Scope):
+                    marker = (id(source), name)
+                    if marker in visiting:
+                        resolved.append(["recursive_column", name])
+                        continue
+                    for i, projection in enumerate(source.expression.selects):
+                        alias = (source.outer_columns[i] if i < len(source.outer_columns)
+                                 else projection.alias_or_name)
+                        if alias.lower() == name:
+                            resolved.append(describe(projection, source, visiting | {marker}))
+                            break
+                    else:
+                        if any(p.is_star for p in source.expression.selects):
+                            resolved.append(describe(exp.column(name), source, visiting | {marker}))
+                        else:
+                            resolved.append(["derived_column", name])
+                elif isinstance(source, exp.Table):
+                    resolved.append(["column", source.name.lower(), name])
+            if len(resolved) == 1:
+                return resolved[0]
+            return ["references", ordered(resolved or [["column", name]])]
+        if isinstance(node, exp.AggFunc):
+            return ["aggregate", node.key, bool(node.find(exp.Distinct)),
+                    ordered(describe(c, scope, visiting) for c in node.find_all(exp.Column))]
+        if isinstance(node, exp.Star):
+            return ["star"]
+        if isinstance(node, exp.Query):
+            child = next((s for s in scope.subquery_scopes if s.expression is node), None)
+            if child:
+                return shape(child)
+            return ["subquery", canonical(node.sql(dialect="sqlite"))]
+        # Stop at aggregates/columns rather than counting their children twice.
+        parts = []
+        def collect(expr):
+            if isinstance(expr, (exp.AggFunc, exp.Column, exp.Star, exp.Query)):
+                parts.append(describe(expr, scope, visiting))
+            else:
+                for child in expr.iter_expressions():
+                    collect(child)
+        collect(node)
+        return ["expression", ordered(parts)]
+
+    def shape(scope):
+        if scope.union_scopes:
+            return {"set_operation": scope.expression.key,
+                    "branches": ordered(shape(s) for s in scope.union_scopes)}
+        group = scope.expression.args.get("group")
+        projections = scope.expression.selects
+        def dimension(node):
+            if isinstance(node, exp.Literal) and node.is_int and 0 < int(node.this) <= len(projections):
+                node = projections[int(node.this)-1]
+            elif isinstance(node, exp.Column) and not node.table:
+                node = next((p for p in projections if p.alias.lower() == node.name.lower()), node)
+            return describe(node, scope)
+        return {"outputs": ordered(describe(p, scope) for p in scope.expression.selects),
+                "group_by": ordered(dimension(p) for p in group.expressions) if group else [],
+                "distinct": bool(scope.expression.args.get("distinct"))}
+
+    return {"tables": tables, "result": shape(root) if root else canonical(sql)}
 
 
 def run_bounded(sql, db_path, params=(), seconds=SHORT_SECONDS, limit=None):
@@ -130,38 +220,58 @@ def execute(sql, db_path, params=(), limit=None, runner=None):
 class Controller:
     """Counters are held by the request, not by SQL text or LLM-provided IDs.
 
-    Overlapping base tables conservatively share a recovery group. Statements
-    without base tables share a separate calculation group per database. Successful
-    exploratory queries never clear timeout history. This is a resource grouping,
-    not a proof that arbitrary SQL rewrites preserve business semantics.
+    Result shapes, not shared tables, determine recovery groups. Successful
+    exploratory queries never clear another group's timeout history. This is a
+    bounded heuristic, not proof that arbitrary rewrites preserve semantics.
     """
     def __init__(self, state, question, trace=None):
         self.state, self.question, self.trace = state, question, trace
         self.state.setdefault("groups", [])
         self.grant = None
+        self.released_pending = None
+        self._migrate_groups()
 
     def log(self, action, **data):
         if self.trace:
             self.trace.log(action, **data)
 
     def _group(self, sql, db_path):
-        tables = set(source_tables(sql))
+        signature = recovery_signature(sql)
         db = str(Path(db_path).resolve())
         groups = self.state["groups"]
-        matches = [g for g in groups if g["db"] == db and
-                   (bool(tables & set(g["tables"])) if tables else not g["tables"])]
-        if not matches:
-            g = {"id": secrets.token_hex(8), "db": db, "tables": sorted(tables), "attempts": []}
-            groups.append(g)
-            return g
-        g = matches[0]
-        for other in matches[1:]:
-            g["attempts"].extend(other["attempts"])
-            g.setdefault("succeeded", []).extend(other.get("succeeded", []))
-            tables.update(other["tables"])
-            groups.remove(other)
-        g["tables"] = sorted(set(g["tables"]) | tables)
+        for g in groups:
+            if g["db"] == db and g.get("signature") == signature:
+                return g
+        g = {"id": secrets.token_hex(8), "db": db, "tables": signature["tables"],
+             "signature": signature, "attempts": []}
+        groups.append(g)
         return g
+
+    def _migrate_groups(self):
+        if self.state.get("grouping_version") == 2:
+            return
+        old_groups = self.state["groups"]
+        self.state["groups"] = []
+        for old in old_groups:
+            for attempt in old["attempts"]:
+                group = self._group(attempt["sql"], old["db"])
+                group["attempts"].append(attempt)
+                # Success fingerprints remain exact-SQL evidence, never grants.
+                group["succeeded"] = sorted(set(group.get("succeeded", [])) |
+                                            set(old.get("succeeded", [])))
+        pending = self.state.get("pending")
+        if pending:
+            group = self._group(pending["sql"], pending["db_path"])
+            pending.update(group_id=group["id"], tables=group["tables"],
+                           attempts=list(group["attempts"]))
+            # Only obsolete pre-execution blocks can resume without approval.
+            # A query that actually timed out, or needs an extension, stays paused.
+            attempted = any(a["fingerprint"] == pending["fingerprint"] for a in group["attempts"])
+            if pending["kind"] == "approval" and not attempted and len(group["attempts"]) < MAX_ATTEMPTS:
+                self.released_pending = self.state.pop("pending")
+                self.log("sql_approval_superseded", approval_id=pending["id"],
+                         reason="unexecuted query no longer shares unrelated timeout history")
+        self.state["grouping_version"] = 2
 
     def _pause(self, g, sql, db_path, params, limit, result, kind):
         pending = {"id": secrets.token_hex(16), "kind": kind, "question": self.question,
@@ -200,7 +310,7 @@ class Controller:
         try:
             key = identity(sql, db_path, params)
             g = self._group(sql, db_path)
-        except (ParseError, ValueError, AttributeError, OSError) as exc:
+        except (SqlglotError, ValueError, AttributeError, OSError) as exc:
             return {"error": "sql_error", "reason": str(exc)}
         granted = self.grant and key == self.grant["fingerprint"]
         seconds = self.grant["seconds"] if granted else SHORT_SECONDS

@@ -158,7 +158,96 @@ class BudgetTests(unittest.TestCase):
     def test_invalid_sql_returns_error_without_consuming_attempt(self):
         c = sql_control.Controller({}, "查询")
         self.assertEqual(c.execute("SELECT FROM (", self.db)["error"], "sql_error")
+        self.assertEqual(c.execute("SELECT SUM(t.n) FROM nums t JOIN nums t ON 1=1", self.db)["error"], "sql_error")
         self.assertEqual(c.state["groups"], [])
+
+    def test_same_table_detail_and_count_do_not_inherit_sum_timeouts(self):
+        c, pending = self.make_pending()
+        c.approve(pending["id"], 60)
+        c.execute(pending["sql"], self.db, runner=lambda _: {"status": "ok"})
+        history = deepcopy(c.state["groups"][0]["attempts"])
+        for sql, expected in [("SELECT n FROM nums ORDER BY n LIMIT 2", [[0], [1]]),
+                              ("SELECT COUNT(*) FROM nums", [[1000]])]:
+            result = c.execute(sql, self.db)
+            self.assertEqual(result.get("rows"), expected, result)
+        self.assertEqual(c.state["groups"][0]["attempts"], history)
+        self.assertEqual(c.execute("SELECT SUM(n*10) FROM nums", self.db,
+                                  runner=lambda _: self.fail("exhausted SUM executed"))["error"],
+                         "sql_approval_required")
+
+    def test_different_finance_questions_keep_separate_attempts(self):
+        c = sql_control.Controller({}, "财务对账")
+        queries = [
+            "SELECT component,state,COUNT(*),SUM(amount) FROM finance_entries GROUP BY component,state",
+            "SELECT COUNT(*),COUNT(DISTINCT journal_id),COUNT(DISTINCT component) FROM finance_entries",
+            "SELECT state,COUNT(*) FROM finance_entries GROUP BY state",
+        ]
+        for sql in queries:
+            result = c.execute(sql, self.db, runner=self.timeout)
+            self.assertEqual(result.get("error"), "query_timeout", result)
+            self.assertEqual(result["attempts_used"], 1)
+        result = c.execute("SELECT state,COUNT(*) FROM finance_entries WHERE shop_id=1 GROUP BY state",
+                           self.db, runner=self.timeout)
+        self.assertEqual(result["attempts_used"], 2)
+        result = c.execute("SELECT f.state,COUNT(*) AS n FROM finance_entries f WHERE shop_id=2 GROUP BY f.state",
+                           self.db, runner=self.timeout)
+        self.assertEqual(result["error"], "sql_approval_required")
+        self.assertEqual(len(result["approval"]["attempts"]), 3)
+
+    def test_renamed_cte_and_subquery_preserve_retry_budget(self):
+        c = sql_control.Controller({}, "汇总")
+        for sql in ["SELECT SUM(n) FROM nums WHERE n>0",
+                    "WITH source AS (SELECT n AS value FROM nums) SELECT SUM(value+1) AS total FROM source",
+                    "SELECT SUM(s.value+2) FROM (SELECT n AS value FROM nums) s WHERE s.value>3"]:
+            result = c.execute(sql, self.db, runner=self.timeout)
+        self.assertEqual(result.get("error"), "sql_approval_required", result)
+        self.assertEqual(len(result["approval"]["attempts"]), 3)
+
+    def test_grouping_alias_and_star_cte_preserve_retry_budget(self):
+        c = sql_control.Controller({}, "分组计数")
+        for sql in ["SELECT n,COUNT(*) FROM nums GROUP BY n",
+                    "WITH x AS (SELECT * FROM nums) SELECT n,COUNT(*) FROM x GROUP BY 1",
+                    "SELECT t.n AS dimension,COUNT(*) FROM nums t WHERE n>0 GROUP BY dimension"]:
+            result = c.execute(sql, self.db, runner=self.timeout)
+        self.assertEqual(result.get("error"), "sql_approval_required", result)
+        self.assertEqual(len(result["approval"]["attempts"]), 3)
+
+    def test_legacy_checkpoint_reclassifies_without_erasing_timeouts(self):
+        c, pending = self.make_pending()
+        c.approve(pending["id"], 60)
+        c.execute(pending["sql"], self.db, runner=lambda _: {"status": "ok"})
+        old = deepcopy(c.state)
+        old.pop("grouping_version")
+        old["groups"][0].pop("signature")
+        old["pending"] = {**pending, "id": "wrong-table-block", "sql": "SELECT n FROM nums LIMIT 2",
+                          "fingerprint": sql_control.identity("SELECT n FROM nums LIMIT 2", self.db)}
+        restored = sql_control.Controller(old, "汇总")
+        self.assertFalse(old.get("pending"))
+        self.assertEqual(restored.released_pending["id"], "wrong-table-block")
+        result = restored.execute(restored.released_pending["sql"], self.db)
+        self.assertEqual(result.get("rows"), [[0], [1]], result)
+        self.assertEqual(sum(len(g["attempts"]) for g in old["groups"]), 3)
+        # Restoring again cannot discard history or release a second ticket.
+        again = sql_control.Controller(json.loads(json.dumps(old)), "汇总")
+        self.assertIsNone(again.released_pending)
+        result = again.execute("SELECT SUM(n*99) FROM nums", self.db,
+                               runner=lambda _: self.fail("history lost during migration"))
+        self.assertEqual(result["error"], "sql_approval_required")
+
+    def test_legacy_real_timeout_and_extension_stay_pending(self):
+        for extension in (False, True):
+            c, pending = self.make_pending()
+            if extension:
+                c.approve(pending["id"], 60)
+                pending = c.execute(pending["sql"], self.db, runner=self.timeout)["approval"]
+            state = deepcopy(c.state); state.pop("grouping_version")
+            for group in state["groups"]: group.pop("signature")
+            restored = sql_control.Controller(state, "汇总")
+            self.assertIsNone(restored.released_pending)
+            self.assertEqual(state["pending"]["id"], pending["id"])
+            restored.approve(pending["id"], 120 if extension else 60)
+            result = restored.execute(pending["sql"], self.db, runner=self.timeout)
+            self.assertEqual(result["approval"]["kind"], "extension")
 
     def test_another_query_cannot_use_grant(self):
         c, p = self.make_pending()
@@ -196,6 +285,48 @@ class RuntimeTests(unittest.TestCase):
 
     def tearDown(self):
         os.chdir(self.oldcwd); self.tmp.cleanup()
+
+    def test_resume_obsolete_table_block_executes_at_five_seconds(self):
+        db = Path("data/ecommerce/ecommerce.sqlite")
+        control = sql_control.Controller({}, "统计后看明细")
+        for i in (1, 2, 3):
+            pending = control.execute(f"SELECT SUM(n*{i}) FROM nums", db,
+                                      runner=BudgetTests.timeout)
+        old = deepcopy(control.state)
+        old.pop("grouping_version")
+        old["groups"][0].pop("signature")
+        sql = "SELECT n FROM nums ORDER BY n LIMIT 2"
+        old["pending"].update(sql=sql, fingerprint=sql_control.identity(sql, db), id="obsolete")
+        state = {"q_count": 0, "executions": {}, "query_control": old,
+                 "request_question": "统计后看明细", "request_budget": 12, "used_turns": 10,
+                 "pending_tool": {"name": "execute_sql", "args": {"sql": sql}}}
+        messages = [{"role": "system", "content": "test"}, {"role": "user", "content": "统计后看明细"},
+                    {"role": "assistant", "content": "", "reasoning_content": "reason",
+                     "tool_calls": [{"id": "original", "type": "function", "function": {"name": "execute_sql", "arguments": json.dumps({"sql": sql})}}]},
+                    {"role": "tool", "tool_call_id": "original", "content": json.dumps(pending)}]
+        Path("sessions/recovery").mkdir(parents=True)
+        checkpoint = Path("sessions/recovery/runtime.json")
+        checkpoint.write_text(json.dumps({"state": state, "messages": messages}))
+        seen = []; real = sql_control.run_bounded
+        def execute(sql, db, params=(), seconds=5, limit=None):
+            seen.append((sql, seconds)); return real(sql, db, params, seconds, limit)
+        def create(**kwargs):
+            self.assertEqual(kwargs["messages"][-2]["reasoning_content"], "")
+            self.assertIn('"rows": [[1], [2]]', kwargs["messages"][-1]["content"])
+            msg = SimpleNamespace(content="明细为1和2 (Q1)\n###EVIDENCE###\nQ1: 前两条明细。", tool_calls=None)
+            return SimpleNamespace(choices=[SimpleNamespace(message=msg)], usage=None)
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test"}), \
+             patch.object(agent_loop, "OpenAI", return_value=client), \
+             patch.object(sql_control, "run_bounded", side_effect=execute):
+            out = agent_loop.run_agent("", "ecommerce", "ecommerce", session_id="recovery", resume=True)
+        self.assertEqual(out["status"], "ok", out)
+        self.assertEqual(out["turns"], 11)
+        self.assertEqual(seen, [(sql, 5)])
+        saved = json.loads(checkpoint.read_text())["state"]
+        self.assertEqual(sum(len(g["attempts"]) for g in saved["query_control"]["groups"]), 3)
+        self.assertNotIn("pending_tool", saved)
+        self.assertNotIn("pending", saved["query_control"])
 
     def test_pause_resume_exact_execution_and_no_extra_work_while_waiting(self):
         class Call:
